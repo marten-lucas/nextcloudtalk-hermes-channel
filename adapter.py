@@ -766,7 +766,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             async def _send_typing() -> None:
                 async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
                     await self._signaling_hello(ws, settings)
-                    await self._signaling_join_room(ws, room_id, session_id)
                     signal_type = "startedTyping" if typing else "stoppedTyping"
                     for recipient_session_id in dict.fromkeys(recipient_session_ids):
                         await ws.send_json(
