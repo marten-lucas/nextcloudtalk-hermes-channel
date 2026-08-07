@@ -637,7 +637,6 @@ def register(ctx: Any) -> None:
         label="Nextcloud Talk",
         adapter_factory=_build_adapter,
         check_fn=nextcloud_deps_present,
-        ensure_deps_fn=ensure_nextcloud_deps,
         validate_config=validate_nextcloud_config,
         is_connected=validate_nextcloud_config,
         required_env=[
