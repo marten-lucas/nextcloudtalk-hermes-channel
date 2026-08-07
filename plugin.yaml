@@ -1,0 +1,68 @@
+name: nextcloud-talk-platform
+label: Nextcloud Talk
+kind: platform
+version: 0.1.0
+description: >
+  Nextcloud Talk gateway adapter for Hermes Agent.
+  Connects as a regular Nextcloud user, listens via WebSocket (HPB) with OCS polling fallback,
+  supports mention gating, on-demand context fetch, replyTo messaging, attachment download stubs,
+  identity passthrough, and HITL approvals via reactions.
+author: Local Development
+requires_env:
+  - name: NEXTCLOUD_BASE_URL
+    description: "Base URL of Nextcloud instance (e.g. https://cloud.example.org)"
+    prompt: "Nextcloud base URL"
+    password: false
+  - name: NEXTCLOUD_USERNAME
+    description: "Nextcloud bot account username (e.g. hermes)"
+    prompt: "Nextcloud bot username"
+    password: false
+  - name: NEXTCLOUD_APP_PASSWORD
+    description: "Nextcloud app password for the bot account"
+    prompt: "Nextcloud app password"
+    password: true
+optional_env:
+  - name: NEXTCLOUD_ALLOWED_USERS
+    description: "Comma-separated user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated)"
+    password: false
+  - name: NEXTCLOUD_ALLOW_ALL_USERS
+    description: "Allow all users to trigger the bot (dev only)"
+    prompt: "Allow all users? (true/false)"
+    password: false
+  - name: NEXTCLOUD_BOT_HANDLE
+    description: "Mention handle used in group rooms (default: @<NEXTCLOUD_USERNAME>)"
+    prompt: "Bot mention handle"
+    password: false
+  - name: NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS
+    description: "Require bot mention in rooms with more than 2 participants (default: true)"
+    prompt: "Require mention in group rooms? (true/false)"
+    password: false
+  - name: NEXTCLOUD_CONTEXT_MESSAGE_LIMIT
+    description: "How many recent messages to fetch when group mention triggers (default: 20)"
+    prompt: "Context message limit"
+    password: false
+  - name: NEXTCLOUD_POLL_INTERVAL_SECONDS
+    description: "Polling interval in seconds when WebSocket is unavailable (default: 3)"
+    prompt: "Polling interval (seconds)"
+    password: false
+  - name: NEXTCLOUD_ALLOWED_ROOMS
+    description: "Optional comma-separated room IDs that bot is allowed to process"
+    prompt: "Allowed rooms (comma-separated)"
+    password: false
+  - name: NEXTCLOUD_ATTACHMENT_TMP_DIR
+    description: "Directory for temporary attachment downloads"
+    prompt: "Attachment temp directory"
+    password: false
+  - name: NEXTCLOUD_HITL_REQUIRE_REQUESTER
+    description: "Only original requester can approve/reject reactions (default: true)"
+    prompt: "Enforce requester-only HITL? (true/false)"
+    password: false
+  - name: NEXTCLOUD_HOME_CHANNEL
+    description: "Default room ID for cron/home delivery"
+    prompt: "Home room ID"
+    password: false
+  - name: NEXTCLOUD_HOME_CHANNEL_NAME
+    description: "Display name for the Nextcloud home room"
+    prompt: "Home room display name"
+    password: false
