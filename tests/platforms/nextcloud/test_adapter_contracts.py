@@ -222,6 +222,26 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await approval_task)
 
+    async def test_hitl_fallback_reply_emoji_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        approval_task = asyncio.create_task(
+            adapter.request_human_approval("room8", "prompt-2", "vorstand")
+        )
+        await asyncio.sleep(0)
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room8",
+                "id": "m-emoji",
+                "actorId": "vorstand",
+                "message": "✅",
+                "referenceId": "prompt-2",
+                "participant_count": 2,
+            }
+        )
+        self.assertTrue(await approval_task)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -411,6 +411,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return
 
         body = str(event.get("message") or event.get("text") or "")
+        if await self._handle_reaction_fallback_from_message(event, sender_id, body):
+            return
         attachments = self._extract_attachments(event)
         participant_count = await self._resolve_participant_count(room_id, event)
         if not self._should_trigger(body, participant_count):
@@ -648,6 +650,37 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if not pending.future.done():
                 pending.future.set_result(False)
             self._pending_approvals.pop(target_message_id, None)
+
+    async def _handle_reaction_fallback_from_message(
+        self,
+        event: Dict[str, Any],
+        sender_id: str,
+        body: str,
+    ) -> bool:
+        emoji = body.strip()
+        if emoji not in self.approve_reactions and emoji not in self.reject_reactions:
+            return False
+
+        target_message_id = str(
+            event.get("referenceId")
+            or event.get("replyTo")
+            or event.get("parentMessageId")
+            or event.get("targetMessageId")
+            or ""
+        ).strip()
+        if not target_message_id:
+            return False
+        if target_message_id not in self._pending_approvals:
+            return False
+
+        await self._handle_reaction(
+            {
+                "targetMessageId": target_message_id,
+                "actorId": sender_id,
+                "emoji": emoji,
+            }
+        )
+        return True
 
     async def _mark_room_active(self, room_id: str) -> Optional[str]:
         data = await self._ocs_post(f"apps/spreed/api/v4/room/{room_id}/participants/active", {"force": True})
