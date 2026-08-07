@@ -85,6 +85,14 @@ class NextcloudRuntimeConfig:
     hitl_require_requester: bool = True
 
 
+@dataclass
+class NextcloudSignalingSettings:
+    server: str
+    hello_auth_params: Dict[str, Any]
+    signaling_mode: str = ""
+    user_id: str = ""
+
+
 class NextcloudTalkPlatform(BasePlatformAdapter):
     """Nextcloud Talk adapter with WebSocket-first transport and polling fallback."""
 
@@ -98,8 +106,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._stop_event = asyncio.Event()
         self._ws_task: Optional[asyncio.Task[None]] = None
         self._polling_task: Optional[asyncio.Task[None]] = None
+        self._room_ws_tasks: Dict[str, asyncio.Task[None]] = {}
         self._poll_cursor_by_room: Dict[str, str] = {}
         self._pending_approvals: Dict[str, PendingApproval] = {}
+        self._active_room_sessions: Dict[str, str] = {}
 
     @staticmethod
     def _as_bool(value: Any, default: bool) -> bool:
@@ -204,13 +214,17 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._stop_event.set()
         tasks = [task for task in (self._ws_task, self._polling_task) if task]
+        tasks.extend(task for task in self._room_ws_tasks.values() if task)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._ws_task = None
         self._polling_task = None
+        self._room_ws_tasks = {}
         if self._session and not self._session.closed:
+            for room_id in list(self._active_room_sessions):
+                await self._leave_room_active(room_id)
             await self._session.close()
         self._session = None
         self._mark_disconnected()
@@ -222,32 +236,58 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         await self.disconnect()
 
     async def _connect_websocket_once(self) -> bool:
+        room_ids = await self._list_joined_rooms()
+        started_any = False
+        for room_id in room_ids:
+            if self.runtime.allowed_rooms and room_id not in self.runtime.allowed_rooms:
+                continue
+            settings = await self._get_signaling_settings(room_id)
+            if not settings:
+                continue
+            task = asyncio.create_task(self._room_signaling_loop(room_id, settings))
+            self._room_ws_tasks[room_id] = task
+            started_any = True
+        if not started_any:
+            logger.warning("Nextcloud: websocket signaling unavailable, falling back to polling")
+        return started_any
+
+    async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingSettings) -> None:
         session = await self._ensure_session()
         try:
-            ws = await session.ws_connect(self._ws_url(), headers=self._ocs_headers(), heartbeat=30)
-        except Exception as exc:
-            logger.warning("Nextcloud: websocket unavailable, falling back to polling: %s", exc)
-            return False
-        self._ws_task = asyncio.create_task(self._websocket_loop(ws))
-        return True
-
-    async def _websocket_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
-        try:
-            async for msg in ws:
-                if self._stop_event.is_set():
-                    return
-                if msg.type == aiohttp.WSMsgType.TEXT:
+            async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
+                await self._signaling_hello(ws, settings)
+                session_id = self._active_room_sessions.get(room_id)
+                if not session_id:
+                    session_id = await self._mark_room_active(room_id)
+                if not session_id:
+                    raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
+                await self._signaling_join_room(ws, room_id, session_id)
+                async for msg in ws:
+                    if self._stop_event.is_set():
+                        return
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            break
+                        continue
                     payload = json.loads(msg.data)
-                    await self.handle_incoming_event(payload)
-                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
-                    break
+                    if payload.get("type") == "event":
+                        event = payload.get("event") or {}
+                        if isinstance(event, dict) and event.get("target") in {"room", "participants"}:
+                            events = await self._fetch_room_events(room_id)
+                            for event_payload in events:
+                                await self.handle_incoming_event(event_payload)
+                    elif payload.get("type") == "room":
+                        events = await self._fetch_room_events(room_id)
+                        for event_payload in events:
+                            await self.handle_incoming_event(event_payload)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("Nextcloud websocket loop ended unexpectedly: %s", exc)
-        finally:
             if not self._stop_event.is_set():
+                logger.warning("Nextcloud websocket room loop ended unexpectedly for %s: %s", room_id, exc)
                 self._start_polling_loop()
+        finally:
+            self._room_ws_tasks.pop(room_id, None)
 
     def _start_polling_loop(self) -> None:
         if self._polling_task and not self._polling_task.done():
@@ -299,6 +339,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if params:
             query.update(params)
         async with session.get(self._talk_url(path), params=query, headers=self._ocs_headers()) as resp:
+            if resp.status == 304:
+                return []
             body = await resp.json()
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
@@ -359,6 +401,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if not self._should_trigger(body, participant_count):
             return
 
+        await self._mark_room_active(room_id)
+        await self._emit_typing_state(room_id, True)
+
         context_messages: List[Dict[str, Any]] = []
         if participant_count > 2:
             context_messages = await self.fetch_last_messages(
@@ -392,7 +437,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             raw_message=event_payload,
             message_id=message_id or None,
         )
-        await self.handle_message(msg_event)
+        try:
+            await self.handle_message(msg_event)
+        finally:
+            await self._emit_typing_state(room_id, False)
 
     def _should_trigger(self, body: str, participant_count: int) -> bool:
         if participant_count <= 2:
@@ -450,6 +498,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     ) -> SendResult:
         if not text:
             return SendResult(success=True)
+        await self._mark_room_active(room_id)
         payload: Dict[str, Any] = {"message": text}
         if reply_to_message_id:
             payload["replyTo"] = reply_to_message_id
@@ -556,6 +605,164 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if not pending.future.done():
                 pending.future.set_result(False)
             self._pending_approvals.pop(target_message_id, None)
+
+    async def _mark_room_active(self, room_id: str) -> Optional[str]:
+        data = await self._ocs_post(f"apps/spreed/api/v4/room/{room_id}/participants/active", {"force": True})
+        session_id: Optional[str] = None
+        if isinstance(data, dict):
+            session_id = str(data.get("sessionId") or data.get("sessionid") or "").strip() or None
+        if session_id:
+            self._active_room_sessions[room_id] = session_id
+        return session_id
+
+    async def _leave_room_active(self, room_id: str) -> None:
+        session_id = self._active_room_sessions.pop(room_id, None)
+        if not session_id:
+            return
+        session = await self._ensure_session()
+        try:
+            async with session.delete(
+                self._talk_url(f"apps/spreed/api/v4/room/{room_id}/participants/active"),
+                headers=self._ocs_headers(),
+            ) as resp:
+                if resp.status >= 400:
+                    logger.warning("Nextcloud: could not mark room %s inactive: %s", room_id, resp.status)
+        except Exception as exc:
+            logger.warning("Nextcloud: could not mark room %s inactive: %s", room_id, exc)
+
+    async def _get_signaling_settings(self, room_id: str) -> Optional[NextcloudSignalingSettings]:
+        data = await self._ocs_get(f"apps/spreed/api/v3/signaling/settings", params={"token": room_id})
+        if not isinstance(data, dict):
+            return None
+        server = str(data.get("server") or "").strip()
+        hello_auth_params = data.get("helloAuthParams") or {}
+        if not server or not isinstance(hello_auth_params, dict):
+            return None
+        return NextcloudSignalingSettings(
+            server=server,
+            hello_auth_params=hello_auth_params,
+            signaling_mode=str(data.get("signalingMode") or ""),
+            user_id=str(data.get("userId") or ""),
+        )
+
+    @staticmethod
+    def _signaling_ws_url(server: str) -> str:
+        url = server.strip()
+        if url.startswith("https://"):
+            url = "wss://" + url[len("https://") :]
+        elif url.startswith("http://"):
+            url = "ws://" + url[len("http://") :]
+        if url.endswith("/"):
+            url = url[:-1]
+        return f"{url}/spreed"
+
+    async def _emit_typing_state(self, room_id: str, typing: bool) -> None:
+        settings = await self._get_signaling_settings(room_id)
+        if not settings:
+            return
+
+        session_id = self._active_room_sessions.get(room_id)
+        if not session_id:
+            session_id = await self._mark_room_active(room_id)
+
+        if not session_id:
+            return
+
+        participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants", params={"includeStatus": "true"})
+        recipient_session_ids: List[str] = []
+        if isinstance(participants, list):
+            for participant in participants:
+                if not isinstance(participant, dict):
+                    continue
+                for participant_session in participant.get("sessionIds") or []:
+                    participant_session_id = str(participant_session or "").strip()
+                    if participant_session_id and participant_session_id != session_id:
+                        recipient_session_ids.append(participant_session_id)
+                participant_session_id = str(participant.get("sessionId") or "").strip()
+                if participant_session_id and participant_session_id != session_id:
+                    recipient_session_ids.append(participant_session_id)
+
+        if not recipient_session_ids:
+            return
+
+        session = await self._ensure_session()
+        try:
+            async def _send_typing() -> None:
+                async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
+                    await self._signaling_hello(ws, settings)
+                    await self._signaling_join_room(ws, room_id, session_id)
+                    signal_type = "startedTyping" if typing else "stoppedTyping"
+                    for recipient_session_id in dict.fromkeys(recipient_session_ids):
+                        await ws.send_json(
+                            {
+                                "type": "message",
+                                "message": {
+                                    "recipient": {
+                                        "type": "session",
+                                        "sessionid": recipient_session_id,
+                                    },
+                                    "data": {
+                                        "type": signal_type,
+                                    },
+                                },
+                            }
+                        )
+            await asyncio.wait_for(_send_typing(), timeout=5)
+        except Exception as exc:
+            logger.warning("Nextcloud: failed to send typing state for room %s: %s", room_id, exc)
+
+    async def _signaling_hello(self, ws: aiohttp.ClientWebSocketResponse, settings: NextcloudSignalingSettings) -> None:
+        hello_version = "2.0" if settings.hello_auth_params.get("2.0") else "1.0"
+        await ws.send_json(
+            {
+                "type": "hello",
+                "hello": {
+                    "version": hello_version,
+                    "auth": {
+                        "url": self._talk_url("apps/spreed/api/v3/signaling/backend"),
+                        "params": settings.hello_auth_params[hello_version],
+                    },
+                },
+            }
+        )
+        while True:
+            msg = await ws.receive()
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                payload = json.loads(msg.data)
+                if payload.get("type") == "welcome":
+                    continue
+                if payload.get("type") == "hello":
+                    return
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"Nextcloud signaling hello failed: {payload}")
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise RuntimeError("Nextcloud signaling websocket closed during hello")
+
+    async def _signaling_join_room(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        room_id: str,
+        session_id: str,
+    ) -> None:
+        await ws.send_json(
+            {
+                "type": "room",
+                "room": {
+                    "roomid": room_id,
+                    "sessionid": session_id,
+                },
+            }
+        )
+        while True:
+            msg = await ws.receive()
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                payload = json.loads(msg.data)
+                if payload.get("type") == "room":
+                    return
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"Nextcloud signaling room join failed: {payload}")
+            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise RuntimeError("Nextcloud signaling websocket closed during room join")
 
 
 def nextcloud_deps_present() -> bool:

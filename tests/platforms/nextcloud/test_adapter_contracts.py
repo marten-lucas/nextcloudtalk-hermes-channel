@@ -25,6 +25,13 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
 
     async def _ocs_get(self, path, params=None):
         self.calls.append(("ocs_get", path, params))
+        if path == "apps/spreed/api/v3/signaling/settings":
+            return {
+                "server": "",
+                "helloAuthParams": {},
+                "signalingMode": "standalone",
+                "userId": "hermes",
+            }
         if path == "apps/spreed/api/v4/room":
             return [{"token": rid} for rid in self.mock_joined_rooms]
         if path.endswith("/participants"):
@@ -38,6 +45,8 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
 
     async def _ocs_post(self, path, data):
         self.calls.append(("ocs_post", path, data))
+        if path.endswith("/participants/active"):
+            return {"sessionId": "session-1"}
         return {"id": "sent-1"}
 
     async def _download_attachment_from_metadata(self, attachment):
@@ -108,6 +117,14 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         last_post = [call for call in adapter.calls if call[0] == "ocs_post"][-1]
         self.assertEqual(last_post[1], "apps/spreed/api/v1/chat/room4")
         self.assertEqual(last_post[2]["replyTo"], "m-parent")
+
+    async def test_send_marks_room_active_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        await adapter.send_message("room4", "Antwort")
+        active_post = [call for call in adapter.calls if call[0] == "ocs_post" and call[1].endswith("/participants/active")]
+        self.assertTrue(active_post)
 
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(

@@ -1,12 +1,12 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 0.1.3
+version: 0.1.4
 description: >
   Nextcloud Talk gateway adapter for Hermes Agent.
   Connects as a regular Nextcloud user, listens via WebSocket (HPB) with OCS polling fallback,
   supports mention gating, on-demand context fetch, replyTo messaging, attachment download stubs,
-  identity passthrough, and HITL approvals via reactions.
+  identity passthrough, active presence/typing signaling, and HITL approvals via reactions.
 author: Local Development
 requires_env:
   - name: NEXTCLOUD_BASE_URL
