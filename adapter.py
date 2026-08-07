@@ -295,14 +295,22 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     async def _ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         session = await self._ensure_session()
-        async with session.get(self._talk_url(path), params=params or {}, headers=self._ocs_headers()) as resp:
+        query = {"format": "json"}
+        if params:
+            query.update(params)
+        async with session.get(self._talk_url(path), params=query, headers=self._ocs_headers()) as resp:
             body = await resp.json()
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
 
     async def _ocs_post(self, path: str, data: Dict[str, Any]) -> Any:
         session = await self._ensure_session()
-        async with session.post(self._talk_url(path), data=data, headers=self._ocs_headers()) as resp:
+        async with session.post(
+            self._talk_url(path),
+            params={"format": "json"},
+            data=data,
+            headers=self._ocs_headers(),
+        ) as resp:
             body = await resp.json()
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
@@ -383,8 +391,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             source=source,
             raw_message=event_payload,
             message_id=message_id or None,
-            user_id=sender_id,
-            user_name=sender_id,
         )
         await self.handle_message(msg_event)
 

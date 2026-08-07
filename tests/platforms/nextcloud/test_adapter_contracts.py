@@ -67,7 +67,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             {"room_id": "room1", "id": "m2", "actorId": "kassier", "message": "@hermes bitte helfen"}
         )
         self.assertEqual(len(adapter.received_events), 1)
-        self.assertEqual(adapter.received_events[0].user_id, "kassier")
+        self.assertEqual(adapter.received_events[0].source["user_id"], "kassier")
 
     async def test_two_participant_room_always_triggers_contract(self):
         adapter = TestableNextcloudTalkPlatform(
