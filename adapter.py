@@ -209,6 +209,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         ws_connected = await self._connect_websocket_once()
         if not ws_connected:
             self._start_polling_loop()
+        else:
+            # Keep polling as a safety net because some signaling setups
+            # do not emit room chat events reliably for bot-style clients.
+            self._start_polling_loop()
         return True
 
     async def disconnect(self) -> None:
