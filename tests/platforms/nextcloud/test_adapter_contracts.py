@@ -25,13 +25,14 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
 
     async def _ocs_get(self, path, params=None):
         self.calls.append(("ocs_get", path, params))
-        if path == "room":
+        if path == "apps/spreed/api/v4/room":
             return [{"token": rid} for rid in self.mock_joined_rooms]
         if path.endswith("/participants"):
-            room_id = path.split("/")[1]
+            parts = path.split("/")
+            room_id = parts[5] if len(parts) > 5 else ""
             count = self.mock_participants.get(room_id, 3)
             return [{"id": f"user-{i}"} for i in range(count)]
-        if path.startswith("chat/"):
+        if "/chat/" in path:
             return list(self.mock_room_messages)
         return []
 
@@ -105,7 +106,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         result = await adapter.send_message("room4", "Antwort", "m-parent")
         self.assertTrue(result.success)
         last_post = [call for call in adapter.calls if call[0] == "ocs_post"][-1]
-        self.assertEqual(last_post[1], "chat/room4")
+        self.assertEqual(last_post[1], "apps/spreed/api/v1/chat/room4")
         self.assertEqual(last_post[2]["replyTo"], "m-parent")
 
     async def test_attachment_contract(self):

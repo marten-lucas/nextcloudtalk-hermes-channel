@@ -188,8 +188,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         # Placeholder endpoint; tune for concrete HPB deployment.
         return f"{self.runtime.base_url}/apps/spreed/ws"
 
-    def _ocs_url(self, path: str) -> str:
-        return urljoin(f"{self.runtime.base_url}/ocs/v2.php/apps/spreed/api/v1/", path.lstrip("/"))
+    def _talk_url(self, path: str) -> str:
+        return urljoin(f"{self.runtime.base_url}/ocs/v2.php/", path.lstrip("/"))
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
@@ -271,16 +271,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             await asyncio.sleep(self.runtime.poll_interval_seconds)
 
     async def _list_joined_rooms(self) -> List[str]:
-        data = await self._ocs_get("room")
+        data = await self._ocs_get("apps/spreed/api/v4/room", params={"includeStatus": "true"})
         if isinstance(data, list):
             return [str(room.get("token", "") or room.get("id", "")) for room in data if room]
         return []
 
     async def _fetch_room_events(self, room_id: str) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"limit": 50}
+        params: Dict[str, Any] = {"lookIntoFuture": 0, "limit": 50}
         if room_id in self._poll_cursor_by_room:
             params["lastKnownMessageId"] = self._poll_cursor_by_room[room_id]
-        data = await self._ocs_get(f"chat/{room_id}", params=params)
+        data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
         events: List[Dict[str, Any]] = []
         if isinstance(data, list):
             for event in data:
@@ -295,14 +295,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     async def _ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         session = await self._ensure_session()
-        async with session.get(self._ocs_url(path), params=params or {}, headers=self._ocs_headers()) as resp:
+        async with session.get(self._talk_url(path), params=params or {}, headers=self._ocs_headers()) as resp:
             body = await resp.json()
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
 
     async def _ocs_post(self, path: str, data: Dict[str, Any]) -> Any:
         session = await self._ensure_session()
-        async with session.post(self._ocs_url(path), data=data, headers=self._ocs_headers()) as resp:
+        async with session.post(self._talk_url(path), data=data, headers=self._ocs_headers()) as resp:
             body = await resp.json()
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
@@ -405,13 +405,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         participants = event.get("participants")
         if isinstance(participants, list):
             return len(participants)
-        api_participants = await self._ocs_get(f"room/{room_id}/participants")
+        api_participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
         if isinstance(api_participants, list):
             return len(api_participants)
         return 3
 
     async def fetch_last_messages(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:
-        data = await self._ocs_get(f"chat/{room_id}", params={"limit": limit})
+        data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params={"lookIntoFuture": 0, "limit": limit})
         if not isinstance(data, list):
             return []
         messages: List[Dict[str, Any]] = []
@@ -449,7 +449,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             payload["replyTo"] = reply_to_message_id
         if metadata:
             payload.update(metadata)
-        data = await self._ocs_post(f"chat/{room_id}", payload)
+        data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
         message_id = None
         if isinstance(data, dict):
             message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
@@ -476,7 +476,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             quoted_path = quote(remote_path.lstrip("/"))
             url = f"{self.runtime.base_url}/remote.php/dav/files/{quote(self.runtime.username)}/{quoted_path}"
         if not url and file_id:
-            url = self._ocs_url(f"chat/file/{file_id}")
+            url = self._talk_url(f"apps/spreed/api/v1/chat/file/{file_id}")
         if not url:
             return None
 
