@@ -384,6 +384,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if self.runtime.allowed_rooms and room_id not in self.runtime.allowed_rooms:
             return
 
+        actor_type = str(event.get("actorType") or event.get("actor_type") or "").strip().lower()
+        if actor_type and actor_type != "users":
+            logger.debug("Nextcloud: ignoring non-user actor message in room %s (actor_type=%s)", room_id, actor_type)
+            return
+        if event.get("systemMessage") or event.get("system_message"):
+            logger.debug("Nextcloud: ignoring system message in room %s", room_id)
+            return
+
         message_id = str(event.get("id") or event.get("message_id") or "")
         sender_id = str(
             event.get("actorId")
@@ -394,9 +402,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
         if not sender_id or sender_id == self.runtime.username:
             return
+        if sender_id.lower() in {"system", "changelog", "sample"}:
+            logger.debug("Nextcloud: ignoring reserved sender %s in room %s", sender_id, room_id)
+            return
 
         body = str(event.get("message") or event.get("text") or "")
-        attachments = event.get("attachments") or event.get("files") or []
+        attachments = self._extract_attachments(event)
         participant_count = await self._resolve_participant_count(room_id, event)
         if not self._should_trigger(body, participant_count):
             return
@@ -518,6 +529,34 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         path = attachment.get("path") or attachment.get("filePath")
         url = attachment.get("url") or attachment.get("downloadUrl")
         return await self.download_attachment(file_id=file_id, remote_path=path, file_url=url)
+
+    @staticmethod
+    def _extract_attachments(event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        direct = event.get("attachments") or event.get("files") or []
+        attachments: List[Dict[str, Any]] = []
+        if isinstance(direct, list):
+            for item in direct:
+                if isinstance(item, dict):
+                    attachments.append(item)
+
+        message_parameters = event.get("messageParameters") or event.get("parameters") or {}
+        if isinstance(message_parameters, dict):
+            for param in message_parameters.values():
+                if not isinstance(param, dict):
+                    continue
+                param_type = str(param.get("type") or "").lower()
+                if param_type != "file":
+                    continue
+                attachment: Dict[str, Any] = {}
+                if param.get("id") is not None:
+                    attachment["id"] = param.get("id")
+                if param.get("path"):
+                    attachment["path"] = param.get("path")
+                if param.get("link"):
+                    attachment["url"] = param.get("link")
+                if attachment:
+                    attachments.append(attachment)
+        return attachments
 
     async def download_attachment(
         self,

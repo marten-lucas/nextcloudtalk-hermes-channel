@@ -146,6 +146,41 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             ["/tmp/mock-attachment"],
         )
 
+    async def test_attachment_from_message_parameters_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room5"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room5",
+                "id": "m-attach-param",
+                "actorId": "vorstand",
+                "message": "{file}",
+                "messageParameters": {
+                    "file": {"type": "file", "id": "file-2", "path": "/Dokumente/hermes-test.md"}
+                },
+            }
+        )
+        self.assertEqual(adapter.received_events[0].raw_message["attachment_paths"], ["/tmp/mock-attachment"])
+
+    async def test_system_message_is_ignored_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room_sys"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room_sys",
+                "id": "m-sys",
+                "actorId": "system",
+                "actorType": "bots",
+                "systemMessage": "conversation_created",
+                "message": "Das System hat die Unterhaltung erstellt",
+            }
+        )
+        self.assertEqual(adapter.received_events, [])
+
     async def test_ws_fallback_to_polling_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
