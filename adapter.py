@@ -788,13 +788,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     recipient_session_ids.append(participant_session_id)
 
         if not recipient_session_ids:
-            return
+            logger.debug("Nextcloud: no recipient sessions for typing in room %s; using room-level fallback", room_id)
 
         session = await self._ensure_session()
         try:
             async def _send_typing() -> None:
                 async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
                     await self._signaling_hello(ws, settings)
+                    await self._signaling_join_room(ws, room_id, session_id)
                     signal_type = "startedTyping" if typing else "stoppedTyping"
                     for recipient_session_id in dict.fromkeys(recipient_session_ids):
                         await ws.send_json(
@@ -804,6 +805,21 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                                     "recipient": {
                                         "type": "session",
                                         "sessionid": recipient_session_id,
+                                    },
+                                    "data": {
+                                        "type": signal_type,
+                                    },
+                                },
+                            }
+                        )
+                    if not recipient_session_ids:
+                        await ws.send_json(
+                            {
+                                "type": "message",
+                                "message": {
+                                    "recipient": {
+                                        "type": "room",
+                                        "roomid": room_id,
                                     },
                                     "data": {
                                         "type": signal_type,
