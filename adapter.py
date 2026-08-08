@@ -440,6 +440,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if await self._handle_reaction_fallback_from_message(event, sender_id, body):
             return
         attachments = self._extract_attachments(event)
+        if not body.strip() and not attachments:
+            logger.debug("Nextcloud: ignoring empty user message in room %s", room_id)
+            return
         participant_count = await self._resolve_participant_count(room_id, event)
         if not self._should_trigger(body, participant_count):
             return

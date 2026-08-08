@@ -181,6 +181,21 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.received_events, [])
 
+    async def test_empty_message_without_attachment_is_ignored_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room_empty"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room_empty",
+                "id": "m-empty",
+                "actorId": "vorstand",
+                "message": "",
+            }
+        )
+        self.assertEqual(adapter.received_events, [])
+
     async def test_ws_fallback_to_polling_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
