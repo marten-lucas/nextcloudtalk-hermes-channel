@@ -39,6 +39,11 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
             room_id = parts[5] if len(parts) > 5 else ""
             count = self.mock_participants.get(room_id, 3)
             return [{"id": f"user-{i}"} for i in range(count)]
+        if path.startswith("cloud/users/") and path.endswith("/groups"):
+            user_id = path.split("/")[2]
+            if user_id == "vorstand":
+                return ["vorstand", "kita"]
+            return []
         if "/chat/" in path:
             return list(self.mock_room_messages)
         return []
@@ -142,6 +147,14 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         active_post = [call for call in adapter.calls if call[0] == "ocs_post" and call[1].endswith("/participants/active")]
         self.assertTrue(active_post)
 
+    async def test_send_clears_typing_state_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter._typing_active_rooms.add("room4")
+        await adapter.send_message("room4", "Antwort")
+        self.assertNotIn("room4", adapter._typing_active_rooms)
+
     async def test_gateway_shutdown_notice_is_suppressed_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
@@ -153,6 +166,25 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.success)
         chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
         self.assertEqual(chat_posts, [])
+
+    async def test_source_includes_display_name_and_groups_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-profile"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-profile",
+                "id": "m-profile",
+                "actorId": "vorstand",
+                "actorDisplayName": "Marten Lucas",
+                "message": "Profiltest",
+            }
+        )
+        source = adapter.received_events[0].source
+        self.assertEqual(source["user_name"], "Marten Lucas")
+        self.assertEqual(source["user_display_name"], "Marten Lucas")
+        self.assertEqual(source["user_groups"], ["vorstand", "kita"])
 
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(

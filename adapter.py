@@ -115,6 +115,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._poll_bootstrapped_rooms: set[str] = set()
         self._pending_approvals: Dict[str, PendingApproval] = {}
         self._active_room_sessions: Dict[str, str] = {}
+        self._typing_active_rooms: set[str] = set()
+        self._user_groups_cache: Dict[str, List[str]] = {}
 
     @staticmethod
     def _as_bool(value: Any, default: bool) -> bool:
@@ -458,6 +460,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         await self._mark_room_active(room_id)
         await self._emit_typing_state(room_id, True)
+        self._typing_active_rooms.add(room_id)
 
         context_messages: List[Dict[str, Any]] = []
         if participant_count > 2:
@@ -473,18 +476,23 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 attachment_paths.append(path)
 
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
+        user_profile = await self._resolve_user_profile(room_id, sender_id, event)
         source = self.build_source(
             chat_id=room_id,
             chat_name=room_id,
             chat_type="dm" if participant_count <= 2 else "group",
             user_id=sender_id,
-            user_name=sender_id,
+            user_name=user_profile["display_name"],
             message_id=message_id or None,
+            user_login=sender_id,
+            user_display_name=user_profile["display_name"],
+            user_groups=user_profile["groups"],
         )
 
         event_payload = dict(event)
         event_payload["context_messages"] = context_messages
         event_payload["attachment_paths"] = attachment_paths
+        event_payload["user_profile"] = user_profile
         msg_event = MessageEvent(
             text=body,
             message_type=msg_type,
@@ -492,10 +500,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             raw_message=event_payload,
             message_id=message_id or None,
         )
-        try:
-            await self.handle_message(msg_event)
-        finally:
-            await self._emit_typing_state(room_id, False)
+        await self.handle_message(msg_event)
 
     def _should_trigger(self, body: str, participant_count: int) -> bool:
         if participant_count <= 2:
@@ -518,6 +523,35 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if isinstance(participants, list):
             return len(participants)
         return 3
+
+    async def _resolve_user_profile(self, room_id: str, sender_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        display_name = str(event.get("actorDisplayName") or "").strip()
+        if not display_name:
+            participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
+            if isinstance(participants, list):
+                for participant in participants:
+                    if not isinstance(participant, dict):
+                        continue
+                    if str(participant.get("actorId") or "").strip() != sender_id:
+                        continue
+                    display_name = str(participant.get("displayName") or "").strip()
+                    if display_name:
+                        break
+        if not display_name:
+            display_name = sender_id
+
+        groups: List[str] = []
+        cached_groups = self._user_groups_cache.get(sender_id)
+        if cached_groups is not None:
+            groups = list(cached_groups)
+        else:
+            group_data = await self._ocs_get(f"cloud/users/{quote(sender_id)}/groups")
+            if isinstance(group_data, list):
+                groups = [str(group).strip() for group in group_data if str(group).strip()]
+                self._user_groups_cache[sender_id] = list(groups)
+            else:
+                self._user_groups_cache[sender_id] = []
+        return {"display_name": display_name, "groups": groups}
 
     async def fetch_last_messages(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params={"lookIntoFuture": 0, "limit": limit})
@@ -565,11 +599,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             payload["replyTo"] = reply_to_message_id
         if metadata:
             payload.update(metadata)
-        data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
-        message_id = None
-        if isinstance(data, dict):
-            message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
-        return SendResult(success=True, message_id=message_id)
+        try:
+            data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
+            message_id = None
+            if isinstance(data, dict):
+                message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
+            return SendResult(success=True, message_id=message_id)
+        finally:
+            if room_id in self._typing_active_rooms:
+                await self._emit_typing_state(room_id, False)
+                self._typing_active_rooms.discard(room_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group"}
