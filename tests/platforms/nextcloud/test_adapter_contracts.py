@@ -191,6 +191,29 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("start_polling",), adapter.calls)
         await adapter.disconnect()
 
+    async def test_polling_bootstrap_skips_existing_history_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        room_id = "room-bootstrap"
+        calls = {"count": 0}
+
+        async def fake_ocs_get(path, params=None):
+            if path != f"apps/spreed/api/v1/chat/{room_id}":
+                return []
+            calls["count"] += 1
+            if calls["count"] == 1:
+                return [{"id": "1", "message": "old1"}, {"id": "2", "message": "old2"}]
+            return [{"id": "3", "message": "new"}]
+
+        adapter._ocs_get = fake_ocs_get  # type: ignore[assignment]
+
+        first = await adapter._fetch_room_events(room_id)
+        second = await adapter._fetch_room_events(room_id)
+        self.assertEqual(first, [])
+        self.assertEqual(len(second), 1)
+        self.assertEqual(second[0]["id"], "3")
+
     async def test_hitl_requester_only_and_no_timeout_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")

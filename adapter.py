@@ -108,6 +108,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._polling_task: Optional[asyncio.Task[None]] = None
         self._room_ws_tasks: Dict[str, asyncio.Task[None]] = {}
         self._poll_cursor_by_room: Dict[str, str] = {}
+        self._poll_bootstrapped_rooms: set[str] = set()
         self._pending_approvals: Dict[str, PendingApproval] = {}
         self._active_room_sessions: Dict[str, str] = {}
 
@@ -322,6 +323,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     async def _fetch_room_events(self, room_id: str) -> List[Dict[str, Any]]:
         params: Dict[str, Any] = {"lookIntoFuture": 0, "limit": 50}
+        if room_id not in self._poll_bootstrapped_rooms:
+            data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
+            if isinstance(data, list) and data:
+                last_id = str(data[-1].get("id", ""))
+                if last_id:
+                    self._poll_cursor_by_room[room_id] = last_id
+            self._poll_bootstrapped_rooms.add(room_id)
+            return []
+
         if room_id in self._poll_cursor_by_room:
             params["lastKnownMessageId"] = self._poll_cursor_by_room[room_id]
         data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
