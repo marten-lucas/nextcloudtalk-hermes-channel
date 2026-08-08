@@ -773,23 +773,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if not session_id:
             return
 
-        participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants", params={"includeStatus": "true"})
-        recipient_session_ids: List[str] = []
-        if isinstance(participants, list):
-            for participant in participants:
-                if not isinstance(participant, dict):
-                    continue
-                for participant_session in participant.get("sessionIds") or []:
-                    participant_session_id = str(participant_session or "").strip()
-                    if participant_session_id and participant_session_id != session_id:
-                        recipient_session_ids.append(participant_session_id)
-                participant_session_id = str(participant.get("sessionId") or "").strip()
-                if participant_session_id and participant_session_id != session_id:
-                    recipient_session_ids.append(participant_session_id)
-
-        if not recipient_session_ids:
-            logger.debug("Nextcloud: no recipient sessions for typing in room %s; using room-level fallback", room_id)
-
         session = await self._ensure_session()
         try:
             async def _send_typing() -> None:
@@ -797,36 +780,20 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     await self._signaling_hello(ws, settings)
                     await self._signaling_join_room(ws, room_id, session_id)
                     signal_type = "startedTyping" if typing else "stoppedTyping"
-                    for recipient_session_id in dict.fromkeys(recipient_session_ids):
-                        await ws.send_json(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "recipient": {
-                                        "type": "session",
-                                        "sessionid": recipient_session_id,
-                                    },
-                                    "data": {
-                                        "type": signal_type,
-                                    },
+                    logger.info("Nextcloud: emitting typing signal for room %s (%s)", room_id, signal_type)
+                    await ws.send_json(
+                        {
+                            "type": "message",
+                            "message": {
+                                "recipient": {
+                                    "type": "room",
                                 },
-                            }
-                        )
-                    if not recipient_session_ids:
-                        await ws.send_json(
-                            {
-                                "type": "message",
-                                "message": {
-                                    "recipient": {
-                                        "type": "room",
-                                        "roomid": room_id,
-                                    },
-                                    "data": {
-                                        "type": signal_type,
-                                    },
+                                "data": {
+                                    "type": signal_type,
                                 },
-                            }
-                        )
+                            },
+                        }
+                    )
             await asyncio.wait_for(_send_typing(), timeout=5)
         except Exception as exc:
             logger.warning("Nextcloud: failed to send typing state for room %s: %s", room_id, exc)
