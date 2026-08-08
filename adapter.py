@@ -332,6 +332,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return []
 
         if room_id in self._poll_cursor_by_room:
+            params["lookIntoFuture"] = 1
             params["lastKnownMessageId"] = self._poll_cursor_by_room[room_id]
         data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
         events: List[Dict[str, Any]] = []
