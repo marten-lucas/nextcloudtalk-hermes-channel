@@ -83,6 +83,7 @@ class NextcloudRuntimeConfig:
     allowed_rooms: set[str] = field(default_factory=set)
     attachment_tmp_dir: str = ""
     hitl_require_requester: bool = True
+    user_groups_overrides: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -173,6 +174,22 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             extra.get("hitl_require_requester") or os.getenv("NEXTCLOUD_HITL_REQUIRE_REQUESTER"),
             True,
         )
+        overrides_raw = str(
+            extra.get("user_groups_overrides")
+            or os.getenv("NEXTCLOUD_USER_GROUPS_OVERRIDES", "")
+        ).strip()
+        user_groups_overrides: Dict[str, List[str]] = {}
+        if overrides_raw:
+            # format: "user1:groupA|groupB,user2:groupC"
+            for entry in overrides_raw.split(","):
+                if ":" not in entry:
+                    continue
+                user_id, groups_raw = entry.split(":", 1)
+                user_key = user_id.strip()
+                if not user_key:
+                    continue
+                groups = [group.strip() for group in groups_raw.split("|") if group.strip()]
+                user_groups_overrides[user_key] = groups
         return NextcloudRuntimeConfig(
             base_url=base_url,
             username=username,
@@ -184,6 +201,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             allowed_rooms=allowed_rooms,
             attachment_tmp_dir=attachment_tmp_dir,
             hitl_require_requester=hitl_require_requester,
+            user_groups_overrides=user_groups_overrides,
         )
 
     def _authorization_header(self) -> str:
@@ -211,7 +229,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     @classmethod
     def _is_gateway_availability_notice(cls, text: str) -> bool:
         normalized = " ".join(text.split()).lower()
-        return normalized in cls.gateway_availability_notices
+        if normalized in cls.gateway_availability_notices:
+            return True
+        if "interrupting current task" in normalized:
+            return True
+        if "redirected current run" in normalized:
+            return True
+        if normalized.startswith("⏳ working"):
+            return True
+        return False
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
@@ -553,6 +579,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 self._user_groups_cache[sender_id] = list(groups)
             else:
                 self._user_groups_cache[sender_id] = []
+        if not groups:
+            groups = list(self.runtime.user_groups_overrides.get(sender_id, []))
         return {"display_name": display_name, "groups": groups}
 
     async def _safe_ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:

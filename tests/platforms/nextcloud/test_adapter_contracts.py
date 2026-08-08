@@ -179,6 +179,18 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
         self.assertEqual(chat_posts, [])
 
+    async def test_interrupting_notice_is_suppressed_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        result = await adapter.send_message(
+            "room4",
+            "⚡ Interrupting current task. I'll respond to your message shortly.",
+        )
+        self.assertTrue(result.success)
+        chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
+        self.assertEqual(chat_posts, [])
+
     async def test_source_includes_display_name_and_groups_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
@@ -223,6 +235,36 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         source = adapter.received_events[0].source
         self.assertEqual(source["user_display_name"], "Marten Lucas")
         self.assertEqual(source["user_groups"], [])
+
+    async def test_user_profile_groups_override_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(
+                base_url="https://nc.local",
+                username="hermes",
+                app_password="pw",
+                user_groups_overrides="vorstand:vorstand|it-admins",
+            )
+        )
+        adapter.mock_participants["room-profile-override"] = 2
+        original_get = adapter._ocs_get
+
+        async def failing_groups(path, params=None):
+            if path.startswith("cloud/users/") and path.endswith("/groups"):
+                return None
+            return await original_get(path, params=params)
+
+        adapter._ocs_get = failing_groups  # type: ignore[assignment]
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-profile-override",
+                "id": "m-profile-override",
+                "actorId": "vorstand",
+                "actorDisplayName": "Marten Lucas",
+                "message": "Profiltest override",
+            }
+        )
+        source = adapter.received_events[0].source
+        self.assertEqual(source["user_groups"], ["vorstand", "it-admins"])
 
     async def test_user_profile_enrichment_works_with_strict_source_contract(self):
         adapter = StrictSourceNextcloudTalkPlatform(
