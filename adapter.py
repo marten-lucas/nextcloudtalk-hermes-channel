@@ -98,6 +98,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     approve_reactions = {"✅", "👍"}
     reject_reactions = {"❌", "👎"}
+    gateway_availability_notices = {
+        "⚠️ gateway shutting down — your current task will be interrupted.",
+        "⏳ gateway is restarting and is not accepting another turn right now.",
+    }
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("nextcloud"))
@@ -201,6 +205,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     def _talk_url(self, path: str) -> str:
         return urljoin(f"{self.runtime.base_url}/ocs/v2.php/", path.lstrip("/"))
+
+    @classmethod
+    def _is_gateway_availability_notice(cls, text: str) -> bool:
+        normalized = " ".join(text.split()).lower()
+        return normalized in cls.gateway_availability_notices
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
@@ -543,6 +552,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         if not text:
+            return SendResult(success=True)
+        if self._is_gateway_availability_notice(text):
+            logger.info(
+                "Nextcloud: suppressing gateway availability notice in room %s; relying on presence state",
+                room_id,
+            )
             return SendResult(success=True)
         await self._mark_room_active(room_id)
         payload: Dict[str, Any] = {"message": text}

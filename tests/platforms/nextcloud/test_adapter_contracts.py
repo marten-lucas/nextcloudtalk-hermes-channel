@@ -142,6 +142,18 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         active_post = [call for call in adapter.calls if call[0] == "ocs_post" and call[1].endswith("/participants/active")]
         self.assertTrue(active_post)
 
+    async def test_gateway_shutdown_notice_is_suppressed_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        result = await adapter.send_message(
+            "room4",
+            "⚠️ Gateway shutting down — Your current task will be interrupted.",
+        )
+        self.assertTrue(result.success)
+        chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
+        self.assertEqual(chat_posts, [])
+
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
