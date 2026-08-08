@@ -214,6 +214,31 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second), 1)
         self.assertEqual(second[0]["id"], "3")
 
+    async def test_poll_cursor_uses_latest_message_id_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        room_id = "room-cursor"
+        calls = {"count": 0}
+
+        async def fake_ocs_get(path, params=None):
+            if path != f"apps/spreed/api/v1/chat/{room_id}":
+                return []
+            calls["count"] += 1
+            if calls["count"] == 1:
+                # Descending order as returned by Talk endpoint
+                return [{"id": "12", "message": "newest"}, {"id": "10", "message": "older"}]
+            return [{"id": "14", "message": "newer"}, {"id": "13", "message": "old"}]
+
+        adapter._ocs_get = fake_ocs_get  # type: ignore[assignment]
+        first = await adapter._fetch_room_events(room_id)
+        self.assertEqual(first, [])
+        self.assertEqual(adapter._poll_cursor_by_room[room_id], "12")
+
+        second = await adapter._fetch_room_events(room_id)
+        self.assertEqual(len(second), 2)
+        self.assertEqual(adapter._poll_cursor_by_room[room_id], "14")
+
     async def test_hitl_requester_only_and_no_timeout_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")

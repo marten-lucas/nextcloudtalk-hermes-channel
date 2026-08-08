@@ -325,10 +325,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         params: Dict[str, Any] = {"lookIntoFuture": 0, "limit": 50}
         if room_id not in self._poll_bootstrapped_rooms:
             data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
-            if isinstance(data, list) and data:
-                last_id = str(data[-1].get("id", ""))
-                if last_id:
-                    self._poll_cursor_by_room[room_id] = last_id
+            latest_id = self._latest_message_id(data if isinstance(data, list) else [])
+            if latest_id:
+                self._poll_cursor_by_room[room_id] = latest_id
             self._poll_bootstrapped_rooms.add(room_id)
             return []
 
@@ -341,11 +340,27 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 normalized = dict(event)
                 normalized.setdefault("room_id", room_id)
                 events.append(normalized)
-            if data:
-                last_id = str(data[-1].get("id", ""))
-                if last_id:
-                    self._poll_cursor_by_room[room_id] = last_id
+            latest_id = self._latest_message_id(data)
+            if latest_id:
+                self._poll_cursor_by_room[room_id] = latest_id
         return events
+
+    @staticmethod
+    def _latest_message_id(messages: List[Dict[str, Any]]) -> Optional[str]:
+        numeric_ids: List[int] = []
+        fallback_ids: List[str] = []
+        for message in messages:
+            raw = str(message.get("id", "")).strip()
+            if not raw:
+                continue
+            fallback_ids.append(raw)
+            try:
+                numeric_ids.append(int(raw))
+            except ValueError:
+                continue
+        if numeric_ids:
+            return str(max(numeric_ids))
+        return fallback_ids[0] if fallback_ids else None
 
     async def _ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
         session = await self._ensure_session()
