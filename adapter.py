@@ -500,14 +500,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         return re.search(pattern, body, flags=re.IGNORECASE) is not None
 
     async def _resolve_participant_count(self, room_id: str, event: Dict[str, Any]) -> int:
+        api_participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
+        if isinstance(api_participants, list):
+            return len(api_participants)
         if "participant_count" in event:
             return int(event["participant_count"])
         participants = event.get("participants")
         if isinstance(participants, list):
             return len(participants)
-        api_participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
-        if isinstance(api_participants, list):
-            return len(api_participants)
         return 3
 
     async def fetch_last_messages(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:

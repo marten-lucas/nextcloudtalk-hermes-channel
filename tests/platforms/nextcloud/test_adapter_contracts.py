@@ -90,6 +90,22 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.received_events), 1)
         self.assertEqual(adapter.received_events[0].source["chat_type"], "dm")
 
+    async def test_group_room_uses_api_participant_count_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room_api"] = 3
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room_api",
+                "id": "m-api-1",
+                "actorId": "vorstand",
+                "message": "Ohne Mention",
+                "participants": [{"id": "vorstand"}, {"id": "ki_assistent"}],
+            }
+        )
+        self.assertEqual(adapter.received_events, [])
+
     async def test_context_fetch_limit_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(
