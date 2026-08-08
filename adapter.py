@@ -485,10 +485,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_id=sender_id,
             user_name=user_profile["display_name"],
             message_id=message_id or None,
-            user_login=sender_id,
-            user_display_name=user_profile["display_name"],
-            user_groups=user_profile["groups"],
         )
+        if isinstance(source, dict):
+            source["user_login"] = sender_id
+            source["user_display_name"] = user_profile["display_name"]
+            source["user_groups"] = user_profile["groups"]
 
         event_payload = dict(event)
         event_payload["context_messages"] = context_messages

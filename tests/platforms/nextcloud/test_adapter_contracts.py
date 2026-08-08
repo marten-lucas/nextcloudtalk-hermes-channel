@@ -62,6 +62,18 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.received_events.append(event)
 
 
+class StrictSourceNextcloudTalkPlatform(TestableNextcloudTalkPlatform):
+    def build_source(self, chat_id, chat_name, chat_type, user_id, user_name, message_id=None):
+        return {
+            "chat_id": chat_id,
+            "chat_name": chat_name,
+            "chat_type": chat_type,
+            "user_id": user_id,
+            "user_name": user_name,
+            "message_id": message_id,
+        }
+
+
 def make_config(**extra):
     return SimpleNamespace(extra=extra, token=None)
 
@@ -211,6 +223,25 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         source = adapter.received_events[0].source
         self.assertEqual(source["user_display_name"], "Marten Lucas")
         self.assertEqual(source["user_groups"], [])
+
+    async def test_user_profile_enrichment_works_with_strict_source_contract(self):
+        adapter = StrictSourceNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-strict"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-strict",
+                "id": "m-strict",
+                "actorId": "vorstand",
+                "actorDisplayName": "Marten Lucas",
+                "message": "Profiltest strict",
+            }
+        )
+        source = adapter.received_events[0].source
+        self.assertEqual(source["user_name"], "Marten Lucas")
+        self.assertEqual(source["user_login"], "vorstand")
+        self.assertEqual(source["user_groups"], ["vorstand", "kita"])
 
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(
