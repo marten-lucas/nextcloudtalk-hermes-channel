@@ -459,8 +459,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return
 
         await self._mark_room_active(room_id)
-        await self._emit_typing_state(room_id, True)
-        self._typing_active_rooms.add(room_id)
+        if room_id not in self._typing_active_rooms:
+            await self._emit_typing_state(room_id, True)
+            self._typing_active_rooms.add(room_id)
 
         context_messages: List[Dict[str, Any]] = []
         if participant_count > 2:
@@ -527,7 +528,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     async def _resolve_user_profile(self, room_id: str, sender_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
         display_name = str(event.get("actorDisplayName") or "").strip()
         if not display_name:
-            participants = await self._ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
+            participants = await self._safe_ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
             if isinstance(participants, list):
                 for participant in participants:
                     if not isinstance(participant, dict):
@@ -545,13 +546,20 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if cached_groups is not None:
             groups = list(cached_groups)
         else:
-            group_data = await self._ocs_get(f"cloud/users/{quote(sender_id)}/groups")
+            group_data = await self._safe_ocs_get(f"cloud/users/{quote(sender_id)}/groups")
             if isinstance(group_data, list):
                 groups = [str(group).strip() for group in group_data if str(group).strip()]
                 self._user_groups_cache[sender_id] = list(groups)
             else:
                 self._user_groups_cache[sender_id] = []
         return {"display_name": display_name, "groups": groups}
+
+    async def _safe_ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        try:
+            return await self._ocs_get(path, params=params)
+        except RuntimeError as exc:
+            logger.warning("Nextcloud: optional profile lookup failed for %s: %s", path, exc)
+            return None
 
     async def fetch_last_messages(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params={"lookIntoFuture": 0, "limit": limit})

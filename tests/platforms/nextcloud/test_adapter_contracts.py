@@ -186,6 +186,32 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source["user_display_name"], "Marten Lucas")
         self.assertEqual(source["user_groups"], ["vorstand", "kita"])
 
+    async def test_user_profile_group_lookup_failure_does_not_break_message_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-profile-fail"] = 2
+        original_get = adapter._ocs_get
+
+        async def flaky_get(path, params=None):
+            if path.startswith("cloud/users/") and path.endswith("/groups"):
+                raise RuntimeError("forbidden")
+            return await original_get(path, params=params)
+
+        adapter._ocs_get = flaky_get  # type: ignore[assignment]
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-profile-fail",
+                "id": "m-profile-fail",
+                "actorId": "vorstand",
+                "actorDisplayName": "Marten Lucas",
+                "message": "Profiltest",
+            }
+        )
+        source = adapter.received_events[0].source
+        self.assertEqual(source["user_display_name"], "Marten Lucas")
+        self.assertEqual(source["user_groups"], [])
+
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
