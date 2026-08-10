@@ -231,6 +231,66 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     def _gateway_lifecycle_state(cls, text: str) -> Optional[str]:
         return cls.gateway_lifecycle_notices.get(cls._normalized_notice_text(text))
 
+    @classmethod
+    def _categorize_gateway_message(cls, text: str) -> tuple[str, dict[str, Any]]:
+        """
+        Categorize a gateway message for appropriate handling.
+        
+        Categories:
+        - "lifecycle": Gateway online/offline/draining status
+        - "error": Error messages that should be shown as reply
+        - "suppress": Queue/progress messages that should not be sent
+        - "forward": Normal bot responses to send as-is
+        
+        Returns tuple of (category, details_dict)
+        """
+        if not text:
+            return ("forward", {})
+        
+        normalized = " ".join(text.split()).strip().lower()
+        
+        # Check for lifecycle events (already handled by _gateway_lifecycle_state)
+        if "gateway restarting" in normalized:
+            return ("lifecycle", {"state": "offline", "text": text})
+        if "gateway online" in normalized and "hermes is back" in normalized:
+            return ("lifecycle", {"state": "online", "text": text})
+        if "draining" in normalized and "active" in normalized and "agent" in normalized:
+            return ("lifecycle", {"state": "draining", "text": text})
+        
+        # Check for error messages (start with ⚠️ or contain error patterns)
+        if text.strip().startswith("⚠️"):
+            return ("error", {"text": text})
+        
+        error_patterns = [
+            "processing stopped",
+            "no response was generated",
+            "session too large",
+            "interrupted before processing",
+            "authentication failed",
+            "provider.*failed",
+            "provider.*rejected",
+            "tool.*failed",
+            "no response after",
+        ]
+        if any(pattern in normalized for pattern in error_patterns):
+            return ("error", {"text": text})
+        
+        # Check for messages to suppress (queue/progress)
+        suppress_patterns = [
+            "gateway.*queued",
+            "compressing context",
+            "compression timed out",
+            "compression aborted",
+            "working —",
+            "subagent working",
+            "steer failed",
+        ]
+        if any(pattern in normalized for pattern in suppress_patterns):
+            return ("suppress", {})
+        
+        # Default: forward as normal bot response
+        return ("forward", {"text": text})
+
     @staticmethod
     def _status_api_path(path: str) -> str:
         base = "apps/user_status/api/v1/user_status"
@@ -749,26 +809,65 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     ) -> SendResult:
         if not text:
             return SendResult(success=True)
-        lifecycle_state = self._gateway_lifecycle_state(text)
-        if lifecycle_state:
-            if lifecycle_state == "offline":
+        
+        # Categorize the message to determine how to handle it
+        category, details = self._categorize_gateway_message(text)
+        
+        if category == "lifecycle":
+            # Lifecycle events: update custom status and presence
+            state = details.get("state")
+            if state == "offline":
                 await self._set_custom_status_message("Gateway restarting", "🔄")
                 await self._set_presence_status("offline")
-            else:
+            elif state == "online":
                 await self._set_presence_status("online")
                 await self._clear_custom_status_message()
+            elif state == "draining":
+                # Show draining message in custom status
+                msg = details.get("text", "Gateway draining")
+                await self._set_custom_status_message(msg[:140], "⏸️")
             return SendResult(success=True)
-        await self._mark_room_active(room_id)
-        payload: Dict[str, Any] = {"message": text}
-        if reply_to_message_id:
-            payload["replyTo"] = reply_to_message_id
-        if metadata:
-            payload.update(metadata)
-        data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
-        message_id = None
-        if isinstance(data, dict):
-            message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
-        return SendResult(success=True, message_id=message_id)
+        
+        elif category == "error":
+            # Error messages: send as reply if we have the trigger message ID
+            if not reply_to_message_id:
+                # Fallback: show error in custom status only
+                await self._set_custom_status_message("Fehler", "⚠️")
+                return SendResult(success=True)
+            
+            # Send error as reply to the trigger message
+            error_text = details.get("text", text)
+            formatted = f"🚫 **Fehler**\n\n{error_text}"
+            await self._mark_room_active(room_id)
+            payload: Dict[str, Any] = {
+                "message": formatted,
+                "replyTo": reply_to_message_id,
+            }
+            if metadata:
+                payload.update(metadata)
+            data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
+            message_id = None
+            if isinstance(data, dict):
+                message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
+            return SendResult(success=True, message_id=message_id)
+        
+        elif category == "suppress":
+            # Suppress queue/progress messages (return silently)
+            return SendResult(success=True)
+        
+        else:  # category == "forward"
+            # Normal bot response: send as-is
+            await self._mark_room_active(room_id)
+            payload: Dict[str, Any] = {"message": text}
+            if reply_to_message_id:
+                payload["replyTo"] = reply_to_message_id
+            if metadata:
+                payload.update(metadata)
+            data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
+            message_id = None
+            if isinstance(data, dict):
+                message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
+            return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group"}
