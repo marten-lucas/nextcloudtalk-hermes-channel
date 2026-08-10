@@ -1,7 +1,7 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 0.1.20
+version: 0.1.22
 description: >
   Nextcloud Talk gateway adapter for Hermes Agent.
   Connects as a regular Nextcloud user, listens via WebSocket (HPB) with OCS polling fallback,
@@ -65,8 +65,4 @@ optional_env:
   - name: NEXTCLOUD_HOME_CHANNEL_NAME
     description: "Display name for the Nextcloud home room"
     prompt: "Home room display name"
-    password: false
-  - name: NEXTCLOUD_USER_GROUPS_OVERRIDES
-    description: "Optional user->groups fallback map when NC group API is not permitted. Format: user:groupA|groupB,user2:groupC"
-    prompt: "User groups overrides"
     password: false

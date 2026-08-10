@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -24,9 +25,11 @@ try:
         MessageType,
         SendResult,
     )
+    from gateway.session import build_session_key  # type: ignore
 except Exception:
     Platform = lambda name: name  # type: ignore
     PlatformConfig = Any  # type: ignore
+    build_session_key = None  # type: ignore
 
     class MessageType:  # pragma: no cover - local fallback
         TEXT = "text"
@@ -60,6 +63,12 @@ except Exception:
         async def handle_message(self, event: MessageEvent) -> None:
             return None
 
+        async def cancel_session_processing(self, session_key: str, **_: Any) -> None:
+            return None
+
+        def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+            return None
+
         def _mark_disconnected(self) -> None:
             return None
 
@@ -83,7 +92,6 @@ class NextcloudRuntimeConfig:
     allowed_rooms: set[str] = field(default_factory=set)
     attachment_tmp_dir: str = ""
     hitl_require_requester: bool = True
-    user_groups_overrides: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,11 +105,13 @@ class NextcloudSignalingSettings:
 class NextcloudTalkPlatform(BasePlatformAdapter):
     """Nextcloud Talk adapter with WebSocket-first transport and polling fallback."""
 
+    supports_status_text = True
     approve_reactions = {"✅", "👍"}
     reject_reactions = {"❌", "👎"}
-    gateway_availability_notices = {
-        "⚠️ gateway shutting down — your current task will be interrupted.",
-        "⏳ gateway is restarting and is not accepting another turn right now.",
+    cancel_reactions = {"⛔"}
+    gateway_lifecycle_notices = {
+        "gateway restarting": "offline",
+        "gateway online": "online",
     }
 
     def __init__(self, config: PlatformConfig):
@@ -116,8 +126,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._poll_bootstrapped_rooms: set[str] = set()
         self._pending_approvals: Dict[str, PendingApproval] = {}
         self._active_room_sessions: Dict[str, str] = {}
-        self._typing_active_rooms: set[str] = set()
-        self._user_groups_cache: Dict[str, List[str]] = {}
+        self._message_index: Dict[str, Dict[str, Any]] = {}
+        self._message_session_keys: Dict[str, Dict[str, str]] = {}
+        self._session_reset_noted_rooms: set[str] = set()
+        self._status_text: Dict[str, str] = {}
+        self._current_presence_state: Optional[str] = None
+        self._current_custom_status: Optional[tuple[Optional[str], str]] = None
 
     @staticmethod
     def _as_bool(value: Any, default: bool) -> bool:
@@ -174,22 +188,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             extra.get("hitl_require_requester") or os.getenv("NEXTCLOUD_HITL_REQUIRE_REQUESTER"),
             True,
         )
-        overrides_raw = str(
-            extra.get("user_groups_overrides")
-            or os.getenv("NEXTCLOUD_USER_GROUPS_OVERRIDES", "")
-        ).strip()
-        user_groups_overrides: Dict[str, List[str]] = {}
-        if overrides_raw:
-            # format: "user1:groupA|groupB,user2:groupC"
-            for entry in overrides_raw.split(","):
-                if ":" not in entry:
-                    continue
-                user_id, groups_raw = entry.split(":", 1)
-                user_key = user_id.strip()
-                if not user_key:
-                    continue
-                groups = [group.strip() for group in groups_raw.split("|") if group.strip()]
-                user_groups_overrides[user_key] = groups
         return NextcloudRuntimeConfig(
             base_url=base_url,
             username=username,
@@ -201,7 +199,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             allowed_rooms=allowed_rooms,
             attachment_tmp_dir=attachment_tmp_dir,
             hitl_require_requester=hitl_require_requester,
-            user_groups_overrides=user_groups_overrides,
         )
 
     def _authorization_header(self) -> str:
@@ -227,17 +224,18 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         return urljoin(f"{self.runtime.base_url}/ocs/v2.php/", path.lstrip("/"))
 
     @classmethod
-    def _is_gateway_availability_notice(cls, text: str) -> bool:
-        normalized = " ".join(text.split()).lower()
-        if normalized in cls.gateway_availability_notices:
-            return True
-        if "interrupting current task" in normalized:
-            return True
-        if "redirected current run" in normalized:
-            return True
-        if normalized.startswith("⏳ working"):
-            return True
-        return False
+    def _normalized_notice_text(cls, text: str) -> str:
+        return " ".join(text.split()).strip().lower().rstrip(".!")
+
+    @classmethod
+    def _gateway_lifecycle_state(cls, text: str) -> Optional[str]:
+        return cls.gateway_lifecycle_notices.get(cls._normalized_notice_text(text))
+
+    @staticmethod
+    def _status_api_path(path: str) -> str:
+        base = "apps/user_status/api/v1/user_status"
+        suffix = path.strip("/")
+        return f"{base}/{suffix}" if suffix else base
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
@@ -251,6 +249,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             # Keep polling as a safety net because some signaling setups
             # do not emit room chat events reliably for bot-style clients.
             self._start_polling_loop()
+        await self._set_presence_status("online")
+        await self._clear_custom_status_message(force=True)
         return True
 
     async def disconnect(self) -> None:
@@ -265,6 +265,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._polling_task = None
         self._room_ws_tasks = {}
         if self._session and not self._session.closed:
+            await self._clear_custom_status_message(force=True)
+            await self._set_presence_status("offline")
             for room_id in list(self._active_room_sessions):
                 await self._leave_room_active(room_id)
             await self._session.close()
@@ -413,14 +415,39 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         return self._ocs_data(body)
 
     async def _ocs_post(self, path: str, data: Dict[str, Any]) -> Any:
+        return await self._ocs_request("post", path, data=data)
+
+    async def _ocs_put(self, path: str, data: Dict[str, Any]) -> Any:
+        return await self._ocs_request("put", path, data=data)
+
+    async def _ocs_delete(self, path: str) -> Any:
+        return await self._ocs_request("delete", path)
+
+    async def _ocs_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         session = await self._ensure_session()
-        async with session.post(
+        query = {"format": "json"}
+        if params:
+            query.update(params)
+        request = getattr(session, method)
+        async with request(
             self._talk_url(path),
-            params={"format": "json"},
+            params=query,
             data=data,
             headers=self._ocs_headers(),
         ) as resp:
-            body = await resp.json()
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                body = await resp.json()
+            else:
+                raw_text = await resp.text()
+                body = {"ocs": {"meta": {"status": "ok", "statuscode": resp.status}, "data": raw_text}}
         self._raise_for_ocs_error(path, body)
         return self._ocs_data(body)
 
@@ -455,11 +482,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if actor_type and actor_type != "users":
             logger.debug("Nextcloud: ignoring non-user actor message in room %s (actor_type=%s)", room_id, actor_type)
             return
-        if event.get("systemMessage") or event.get("system_message"):
+
+        event_type = str(event.get("eventType", event.get("type", "message"))).lower()
+        is_edit = "edit" in event_type
+        is_delete = "delete" in event_type or "remove" in event_type
+        if (event.get("systemMessage") or event.get("system_message")) and not is_delete:
             logger.debug("Nextcloud: ignoring system message in room %s", room_id)
             return
 
-        message_id = str(event.get("id") or event.get("message_id") or "")
+        message_id = str(event.get("id") or event.get("message_id") or event.get("messageId") or "")
         sender_id = str(
             event.get("actorId")
             or event.get("actor_id")
@@ -473,21 +504,33 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             logger.debug("Nextcloud: ignoring reserved sender %s in room %s", sender_id, room_id)
             return
 
+        original_message_id = str(
+            event.get("messageId")
+            or event.get("objectId")
+            or event.get("referenceId")
+            or message_id
+        ).strip() or message_id
+        original_record = self._message_index.get(original_message_id, {})
         body = str(event.get("message") or event.get("text") or "")
+        trigger_text = body
         if await self._handle_reaction_fallback_from_message(event, sender_id, body):
             return
         attachments = self._extract_attachments(event)
+        timestamp_source = original_record.get("timestamp") or event.get("timestamp") or event.get("datetime")
+        time_label = self._format_event_time(timestamp_source)
+        if is_edit:
+            body = f"Vergangene Nachricht von {time_label} wurde geaendert zu:\n{body.strip()}".strip()
+        elif is_delete:
+            body = f"Nachricht von {time_label} wurde geloescht."
+            trigger_text = str(original_record.get("text") or "")
         if not body.strip() and not attachments:
             logger.debug("Nextcloud: ignoring empty user message in room %s", room_id)
             return
         participant_count = await self._resolve_participant_count(room_id, event)
-        if not self._should_trigger(body, participant_count):
+        if not self._should_trigger(trigger_text or body, participant_count):
             return
 
         await self._mark_room_active(room_id)
-        if room_id not in self._typing_active_rooms:
-            await self._emit_typing_state(room_id, True)
-            self._typing_active_rooms.add(room_id)
 
         context_messages: List[Dict[str, Any]] = []
         if participant_count > 2:
@@ -502,25 +545,40 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if path:
                 attachment_paths.append(path)
 
+        body = self._normalize_nextcloud_command(body)
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
-        user_profile = await self._resolve_user_profile(room_id, sender_id, event)
         source = self.build_source(
             chat_id=room_id,
             chat_name=room_id,
             chat_type="dm" if participant_count <= 2 else "group",
             user_id=sender_id,
-            user_name=user_profile["display_name"],
+            user_name=sender_id,
             message_id=message_id or None,
         )
-        if isinstance(source, dict):
-            source["user_login"] = sender_id
-            source["user_display_name"] = user_profile["display_name"]
-            source["user_groups"] = user_profile["groups"]
+        session_key = self._build_gateway_session_key(source)
+        if session_key:
+            self._message_session_keys[original_message_id] = {
+                "session_key": session_key,
+                "requester_user_id": sender_id,
+                "chat_id": room_id,
+            }
+        if not is_delete:
+            self._message_index[original_message_id] = {
+                "room_id": room_id,
+                "sender_id": sender_id,
+                "text": str(event.get("message") or event.get("text") or ""),
+                "timestamp": event.get("timestamp") or event.get("datetime"),
+            }
+        reset_note = await self._fresh_session_note(source, room_id, original_message_id)
+        if reset_note:
+            body = f"{reset_note}\n\n{body}"
 
         event_payload = dict(event)
         event_payload["context_messages"] = context_messages
         event_payload["attachment_paths"] = attachment_paths
-        event_payload["user_profile"] = user_profile
+        event_payload["original_message_id"] = original_message_id
+        event_payload["is_edit_event"] = is_edit
+        event_payload["is_delete_event"] = is_delete
         msg_event = MessageEvent(
             text=body,
             message_type=msg_type,
@@ -552,44 +610,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return len(participants)
         return 3
 
-    async def _resolve_user_profile(self, room_id: str, sender_id: str, event: Dict[str, Any]) -> Dict[str, Any]:
-        display_name = str(event.get("actorDisplayName") or "").strip()
-        if not display_name:
-            participants = await self._safe_ocs_get(f"apps/spreed/api/v4/room/{room_id}/participants")
-            if isinstance(participants, list):
-                for participant in participants:
-                    if not isinstance(participant, dict):
-                        continue
-                    if str(participant.get("actorId") or "").strip() != sender_id:
-                        continue
-                    display_name = str(participant.get("displayName") or "").strip()
-                    if display_name:
-                        break
-        if not display_name:
-            display_name = sender_id
-
-        groups: List[str] = []
-        cached_groups = self._user_groups_cache.get(sender_id)
-        if cached_groups is not None:
-            groups = list(cached_groups)
-        else:
-            group_data = await self._safe_ocs_get(f"cloud/users/{quote(sender_id)}/groups")
-            if isinstance(group_data, list):
-                groups = [str(group).strip() for group in group_data if str(group).strip()]
-                self._user_groups_cache[sender_id] = list(groups)
-            else:
-                self._user_groups_cache[sender_id] = []
-        if not groups:
-            groups = list(self.runtime.user_groups_overrides.get(sender_id, []))
-        return {"display_name": display_name, "groups": groups}
-
-    async def _safe_ocs_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        try:
-            return await self._ocs_get(path, params=params)
-        except RuntimeError as exc:
-            logger.warning("Nextcloud: optional profile lookup failed for %s: %s", path, exc)
-            return None
-
     async def fetch_last_messages(self, room_id: str, limit: int = 20) -> List[Dict[str, Any]]:
         data = await self._ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params={"lookIntoFuture": 0, "limit": limit})
         if not isinstance(data, list):
@@ -605,6 +625,111 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 }
             )
         return messages
+
+    @staticmethod
+    def _format_event_time(raw_timestamp: Any) -> str:
+        if raw_timestamp in (None, ""):
+            return "unbekannter Zeit"
+        try:
+            numeric = float(raw_timestamp)
+            if numeric > 1_000_000_000_000:
+                numeric /= 1000.0
+            return datetime.fromtimestamp(numeric, tz=timezone.utc).astimezone().strftime("%H:%M")
+        except (TypeError, ValueError, OSError):
+            return str(raw_timestamp)
+
+    @staticmethod
+    def _fallback_known_commands() -> set[str]:
+        return {
+            "approve",
+            "background",
+            "deny",
+            "help",
+            "model",
+            "new",
+            "reload-mcp",
+            "reset",
+            "resume",
+            "status",
+            "stop",
+        }
+
+    @classmethod
+    def _resolve_known_command(cls, name: str) -> Optional[str]:
+        token = str(name or "").strip().lower()
+        if not token:
+            return None
+        candidates = [token]
+        hyphenated = token.replace("_", "-")
+        if hyphenated != token:
+            candidates.append(hyphenated)
+        try:
+            from hermes_cli.commands import is_gateway_known_command  # type: ignore
+
+            for candidate in candidates:
+                if is_gateway_known_command(candidate):
+                    return candidate
+        except Exception:
+            pass
+        try:
+            from agent.skill_commands import get_skill_commands  # type: ignore
+
+            skill_commands = get_skill_commands() or {}
+            for candidate in candidates:
+                if f"/{candidate}" in skill_commands:
+                    return candidate
+        except Exception:
+            pass
+        for candidate in candidates:
+            if candidate in cls._fallback_known_commands():
+                return candidate
+        return None
+
+    @classmethod
+    def _normalize_nextcloud_command(cls, text: str) -> str:
+        if not text.startswith("!"):
+            return text
+        match = re.match(r"^!([A-Za-z][A-Za-z0-9_-]*)(?=$|\s)(.*)$", text, flags=re.DOTALL)
+        if not match:
+            return text
+        resolved = cls._resolve_known_command(match.group(1))
+        if resolved is None:
+            return text
+        return f"/{resolved}{match.group(2) or ''}"
+
+    def _build_gateway_session_key(self, source: Any) -> Optional[str]:
+        if not callable(build_session_key):
+            return None
+        try:
+            return build_session_key(
+                source,
+                group_sessions_per_user=getattr(self.config, "extra", {}).get("group_sessions_per_user", True),
+                thread_sessions_per_user=getattr(self.config, "extra", {}).get("thread_sessions_per_user", False),
+            )
+        except Exception:
+            return None
+
+    async def _fresh_session_note(self, source: Any, room_id: str, current_message_id: str) -> Optional[str]:
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None or room_id in self._session_reset_noted_rooms:
+            return None
+        session_key = self._build_gateway_session_key(source)
+        if not session_key:
+            return None
+        try:
+            if runner._peek_session_state(session_key) is not None:
+                return None
+        except Exception:
+            return None
+        recent_messages = await self.fetch_last_messages(room_id, limit=2)
+        prior_messages = [item for item in recent_messages if str(item.get("id") or "") != current_message_id]
+        if not prior_messages:
+            return None
+        self._session_reset_noted_rooms.add(room_id)
+        return (
+            "[System note: Hermes session in this existing chat was reset. "
+            "Earlier room history was not reloaded automatically; please summarize older context if it matters.]"
+        )
 
     async def send(
         self,
@@ -624,11 +749,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     ) -> SendResult:
         if not text:
             return SendResult(success=True)
-        if self._is_gateway_availability_notice(text):
-            logger.info(
-                "Nextcloud: suppressing gateway availability notice in room %s; relying on presence state",
-                room_id,
-            )
+        lifecycle_state = self._gateway_lifecycle_state(text)
+        if lifecycle_state:
+            if lifecycle_state == "offline":
+                await self._set_custom_status_message("Gateway restarting", "🔄")
+                await self._set_presence_status("offline")
+            else:
+                await self._set_presence_status("online")
+                await self._clear_custom_status_message()
             return SendResult(success=True)
         await self._mark_room_active(room_id)
         payload: Dict[str, Any] = {"message": text}
@@ -636,19 +764,92 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             payload["replyTo"] = reply_to_message_id
         if metadata:
             payload.update(metadata)
-        try:
-            data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
-            message_id = None
-            if isinstance(data, dict):
-                message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
-            return SendResult(success=True, message_id=message_id)
-        finally:
-            if room_id in self._typing_active_rooms:
-                await self._emit_typing_state(room_id, False)
-                self._typing_active_rooms.discard(room_id)
+        data = await self._ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
+        message_id = None
+        if isinstance(data, dict):
+            message_id = str(data.get("id", "") or data.get("messageId", "") or "") or None
+        return SendResult(success=True, message_id=message_id)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": chat_id, "type": "group"}
+
+    async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        await self._mark_room_active(chat_id)
+        live_text = self._status_text.get(str(chat_id))
+        if live_text:
+            await self._set_custom_status_message(live_text, "💬")
+        else:
+            await self._set_custom_status_message("Antwort wird geschrieben", "✍️")
+        await self._emit_typing_state(chat_id, True)
+
+    async def stop_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
+        await self._emit_typing_state(chat_id, False)
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        self.set_status_text(event.source.chat_id, "Liest Kontext")
+        await self._set_presence_status("online")
+        await self._set_custom_status_message("Liest Kontext", "📖")
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        self.set_status_text(event.source.chat_id, None)
+        await self._set_presence_status("online")
+        await self._clear_custom_status_message()
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        message, icon = self._map_progress_status(status_key, content)
+        if message:
+            self.set_status_text(chat_id, message)
+            await self._set_custom_status_message(message, icon)
+        return SendResult(success=True)
+
+    @staticmethod
+    def _map_progress_status(status_key: str, content: str) -> tuple[Optional[str], Optional[str]]:
+        normalized_key = str(status_key or "").strip().lower()
+        normalized_content = " ".join(str(content or "").split()).strip()
+        normalized_lower = normalized_content.lower()
+        if "context" in normalized_lower:
+            return "Liest Kontext", "📖"
+        if normalized_key == "_thinking" or normalized_lower.startswith("💬 "):
+            return "Denkt nach", "🤔"
+        if normalized_key.startswith("tool.") or "tool" in normalized_key:
+            return "Fuehrt Werkzeuge aus", "🛠️"
+        if normalized_content:
+            return (normalized_content[:80], "💬")
+        return None, None
+
+    async def _set_presence_status(self, state: str) -> None:
+        normalized = str(state or "").strip().lower()
+        if normalized == self._current_presence_state:
+            return
+        await self._ocs_put(self._status_api_path("status"), {"statusType": normalized})
+        self._current_presence_state = normalized
+
+    async def _set_custom_status_message(self, message: str, status_icon: Optional[str] = None) -> None:
+        normalized_message = " ".join(str(message or "").split()).strip()
+        normalized_icon = status_icon or None
+        new_state = (normalized_icon, normalized_message)
+        if not normalized_message or new_state == self._current_custom_status:
+            return
+        payload: Dict[str, Any] = {
+            "message": normalized_message[:140],
+        }
+        if normalized_icon is not None:
+            payload["statusIcon"] = normalized_icon
+        await self._ocs_put(self._status_api_path("message/custom"), payload)
+        self._current_custom_status = new_state
+
+    async def _clear_custom_status_message(self, *, force: bool = False) -> None:
+        if self._current_custom_status is None and not force:
+            return
+        await self._ocs_delete(self._status_api_path("message"))
+        self._current_custom_status = None
 
     async def _download_attachment_from_metadata(self, attachment: Dict[str, Any]) -> Optional[str]:
         file_id = attachment.get("id") or attachment.get("fileId")
@@ -742,9 +943,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
         if not target_message_id:
             return
-        pending = self._pending_approvals.get(target_message_id)
-        if not pending:
-            return
 
         reactor_id = str(
             event.get("actorId")
@@ -754,6 +952,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             or ""
         )
         emoji = str(event.get("emoji") or event.get("reaction") or event.get("key") or "")
+        if emoji in self.cancel_reactions:
+            session_info = self._message_session_keys.get(target_message_id)
+            if session_info and reactor_id == session_info.get("requester_user_id"):
+                await self.cancel_session_processing(session_info["session_key"])
+            return
+        pending = self._pending_approvals.get(target_message_id)
+        if not pending:
+            return
         if self.runtime.hitl_require_requester and reactor_id != pending.requester_user_id:
             logger.info(
                 "Nextcloud: ignoring approval reaction from %s; requester is %s",

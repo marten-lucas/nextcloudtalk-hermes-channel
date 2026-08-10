@@ -2,6 +2,7 @@ import asyncio
 import unittest
 from types import SimpleNamespace
 
+import adapter as nextcloud_adapter_module
 from adapter import NextcloudTalkPlatform
 
 
@@ -14,6 +15,10 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.mock_joined_rooms = []
         self.connect_websocket_success = True
         self.received_events = []
+        self.presence_updates = []
+        self.custom_status_updates = []
+        self.custom_status_clears = []
+        self.cancelled_sessions = []
 
     async def _connect_websocket_once(self) -> bool:
         self.calls.append(("connect_websocket",))
@@ -39,11 +44,6 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
             room_id = parts[5] if len(parts) > 5 else ""
             count = self.mock_participants.get(room_id, 3)
             return [{"id": f"user-{i}"} for i in range(count)]
-        if path.startswith("cloud/users/") and path.endswith("/groups"):
-            user_id = path.split("/")[2]
-            if user_id == "vorstand":
-                return ["vorstand", "kita"]
-            return []
         if "/chat/" in path:
             return list(self.mock_room_messages)
         return []
@@ -58,20 +58,20 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.calls.append(("download_attachment", attachment))
         return "/tmp/mock-attachment"
 
+    async def _set_presence_status(self, state):
+        self.presence_updates.append(state)
+
+    async def _set_custom_status_message(self, message, status_icon=None):
+        self.custom_status_updates.append((message, status_icon))
+
+    async def _clear_custom_status_message(self, force=False):
+        self.custom_status_clears.append(force)
+
+    async def cancel_session_processing(self, session_key, **kwargs):
+        self.cancelled_sessions.append((session_key, kwargs))
+
     async def handle_message(self, event):
         self.received_events.append(event)
-
-
-class StrictSourceNextcloudTalkPlatform(TestableNextcloudTalkPlatform):
-    def build_source(self, chat_id, chat_name, chat_type, user_id, user_name, message_id=None):
-        return {
-            "chat_id": chat_id,
-            "chat_name": chat_name,
-            "chat_type": chat_type,
-            "user_id": user_id,
-            "user_name": user_name,
-            "message_id": message_id,
-        }
 
 
 def make_config(**extra):
@@ -159,39 +159,40 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         active_post = [call for call in adapter.calls if call[0] == "ocs_post" and call[1].endswith("/participants/active")]
         self.assertTrue(active_post)
 
-    async def test_send_clears_typing_state_contract(self):
+    async def test_bang_command_alias_maps_to_gateway_command_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
-        adapter._typing_active_rooms.add("room4")
-        await adapter.send_message("room4", "Antwort")
-        self.assertNotIn("room4", adapter._typing_active_rooms)
+        adapter.mock_participants["room-bang"] = 2
+        await adapter.handle_incoming_event(
+            {"room_id": "room-bang", "id": "m-bang", "actorId": "vorstand", "message": "!stop bitte"}
+        )
+        self.assertEqual(adapter.received_events[0].text, "/stop bitte")
+        self.assertEqual(adapter.received_events[0].message_type, "command")
 
-    async def test_gateway_shutdown_notice_is_suppressed_contract(self):
+    async def test_gateway_restarting_notice_updates_presence_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
-        result = await adapter.send_message(
-            "room4",
-            "⚠️ Gateway shutting down — Your current task will be interrupted.",
-        )
+        result = await adapter.send_message("room4", "Gateway restarting")
         self.assertTrue(result.success)
         chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
         self.assertEqual(chat_posts, [])
+        self.assertEqual(adapter.presence_updates[-1], "offline")
+        self.assertEqual(adapter.custom_status_updates[-1], ("Gateway restarting", "🔄"))
 
-    async def test_interrupting_notice_is_suppressed_contract(self):
+    async def test_gateway_online_notice_updates_presence_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
-        result = await adapter.send_message(
-            "room4",
-            "⚡ Interrupting current task. I'll respond to your message shortly.",
-        )
+        result = await adapter.send_message("room4", "gateway online")
         self.assertTrue(result.success)
         chat_posts = [call for call in adapter.calls if call[0] == "ocs_post" and "/chat/" in call[1]]
         self.assertEqual(chat_posts, [])
+        self.assertEqual(adapter.presence_updates[-1], "online")
+        self.assertTrue(adapter.custom_status_clears)
 
-    async def test_source_includes_display_name_and_groups_contract(self):
+    async def test_source_uses_username_only_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
@@ -206,84 +207,28 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         source = adapter.received_events[0].source
-        self.assertEqual(source["user_name"], "Marten Lucas")
-        self.assertEqual(source["user_display_name"], "Marten Lucas")
-        self.assertEqual(source["user_groups"], ["vorstand", "kita"])
+        self.assertEqual(source["user_id"], "vorstand")
+        self.assertEqual(source["user_name"], "vorstand")
 
-    async def test_user_profile_group_lookup_failure_does_not_break_message_contract(self):
+    async def test_fresh_session_existing_chat_adds_reset_note_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
-        adapter.mock_participants["room-profile-fail"] = 2
-        original_get = adapter._ocs_get
-
-        async def flaky_get(path, params=None):
-            if path.startswith("cloud/users/") and path.endswith("/groups"):
-                raise RuntimeError("forbidden")
-            return await original_get(path, params=params)
-
-        adapter._ocs_get = flaky_get  # type: ignore[assignment]
-        await adapter.handle_incoming_event(
-            {
-                "room_id": "room-profile-fail",
-                "id": "m-profile-fail",
-                "actorId": "vorstand",
-                "actorDisplayName": "Marten Lucas",
-                "message": "Profiltest",
-            }
-        )
-        source = adapter.received_events[0].source
-        self.assertEqual(source["user_display_name"], "Marten Lucas")
-        self.assertEqual(source["user_groups"], [])
-
-    async def test_user_profile_groups_override_contract(self):
-        adapter = TestableNextcloudTalkPlatform(
-            make_config(
-                base_url="https://nc.local",
-                username="hermes",
-                app_password="pw",
-                user_groups_overrides="vorstand:vorstand|it-admins",
+        adapter.mock_participants["room-reset-note"] = 2
+        adapter.mock_room_messages = [
+            {"id": "1", "actorId": "vorstand", "message": "alt"},
+            {"id": "2", "actorId": "vorstand", "message": "neu"},
+        ]
+        adapter.gateway_runner = SimpleNamespace(_peek_session_state=lambda session_key: None)
+        original_build_session_key = nextcloud_adapter_module.build_session_key
+        nextcloud_adapter_module.build_session_key = lambda source, **kwargs: "session:room-reset-note"
+        try:
+            await adapter.handle_incoming_event(
+                {"room_id": "room-reset-note", "id": "2", "actorId": "vorstand", "message": "Aktuelle Frage"}
             )
-        )
-        adapter.mock_participants["room-profile-override"] = 2
-        original_get = adapter._ocs_get
-
-        async def failing_groups(path, params=None):
-            if path.startswith("cloud/users/") and path.endswith("/groups"):
-                return None
-            return await original_get(path, params=params)
-
-        adapter._ocs_get = failing_groups  # type: ignore[assignment]
-        await adapter.handle_incoming_event(
-            {
-                "room_id": "room-profile-override",
-                "id": "m-profile-override",
-                "actorId": "vorstand",
-                "actorDisplayName": "Marten Lucas",
-                "message": "Profiltest override",
-            }
-        )
-        source = adapter.received_events[0].source
-        self.assertEqual(source["user_groups"], ["vorstand", "it-admins"])
-
-    async def test_user_profile_enrichment_works_with_strict_source_contract(self):
-        adapter = StrictSourceNextcloudTalkPlatform(
-            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
-        )
-        adapter.mock_participants["room-strict"] = 2
-        await adapter.handle_incoming_event(
-            {
-                "room_id": "room-strict",
-                "id": "m-strict",
-                "actorId": "vorstand",
-                "actorDisplayName": "Marten Lucas",
-                "message": "Profiltest strict",
-            }
-        )
-        source = adapter.received_events[0].source
-        self.assertEqual(source["user_name"], "Marten Lucas")
-        self.assertEqual(source["user_login"], "vorstand")
-        self.assertEqual(source["user_groups"], ["vorstand", "kita"])
+        finally:
+            nextcloud_adapter_module.build_session_key = original_build_session_key
+        self.assertIn("was reset", adapter.received_events[0].text)
 
     async def test_attachment_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -340,6 +285,47 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.received_events, [])
 
+    async def test_edit_event_reenters_as_contextual_message_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-edit"] = 2
+        await adapter.handle_incoming_event(
+            {"room_id": "room-edit", "id": "m1", "actorId": "vorstand", "message": "alt"}
+        )
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-edit",
+                "id": "m1-edit",
+                "messageId": "m1",
+                "actorId": "vorstand",
+                "eventType": "message_edit",
+                "message": "neu",
+                "timestamp": 1723101000,
+            }
+        )
+        self.assertIn("wurde geaendert zu", adapter.received_events[-1].text)
+        self.assertIn("neu", adapter.received_events[-1].text)
+
+    async def test_delete_event_reenters_as_contextual_message_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-delete"] = 2
+        await adapter.handle_incoming_event(
+            {"room_id": "room-delete", "id": "m-del", "actorId": "vorstand", "message": "bitte loeschen"}
+        )
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-delete",
+                "id": "m-del-delete",
+                "messageId": "m-del",
+                "actorId": "vorstand",
+                "eventType": "message_delete",
+            }
+        )
+        self.assertIn("wurde geloescht", adapter.received_events[-1].text)
+
     async def test_empty_message_without_attachment_is_ignored_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
@@ -364,6 +350,8 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("connect_websocket",), adapter.calls)
         self.assertIn(("start_polling",), adapter.calls)
         await adapter.disconnect()
+        self.assertIn("online", adapter.presence_updates)
+        self.assertIn("offline", adapter.presence_updates)
 
     async def test_polling_bootstrap_skips_existing_history_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -466,6 +454,32 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertTrue(await approval_task)
+
+    async def test_cancel_reaction_stops_matching_session_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter._message_session_keys["prompt-9"] = {
+            "session_key": "nextcloud:session:9",
+            "requester_user_id": "vorstand",
+            "chat_id": "room9",
+        }
+        await adapter.handle_incoming_event(
+            {
+                "type": "reaction",
+                "targetMessageId": "prompt-9",
+                "actorId": "vorstand",
+                "emoji": "⛔",
+            }
+        )
+        self.assertEqual(adapter.cancelled_sessions[0][0], "nextcloud:session:9")
+
+    async def test_status_update_sets_custom_presence_text_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        await adapter.send_or_update_status("room10", "tool.started", "Running tool")
+        self.assertEqual(adapter.custom_status_updates[-1], ("Fuehrt Werkzeuge aus", "🛠️"))
 
 
 if __name__ == "__main__":
