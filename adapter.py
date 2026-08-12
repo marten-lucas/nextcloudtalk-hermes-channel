@@ -236,13 +236,45 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         """
         Categorize a gateway message for appropriate handling.
         
-        Categories:
-        - "lifecycle": Gateway online/offline/draining status
-        - "error": Error messages that should be shown as reply
-        - "suppress": Queue/progress messages that should not be sent
-        - "forward": Normal bot responses to send as-is
+        This method implements updatefat (no i18n keys) message categorization using
+        pattern-based detection. Messages are routed to different handlers based on content:
         
-        Returns tuple of (category, details_dict)
+        **Category: "lifecycle"**
+        - Gateway operational state changes (online/offline/draining)
+        - Patterns: "gateway restarting", "gateway online — hermes is back", "draining"
+        - Handling: Update custom status and presence; no chat message sent
+        - Why: Administrative events belong in bot presence, not chat
+        
+        **Category: "error"**
+        - Error and failure messages from model/tool execution
+        - Patterns: "processing stopped", "no response", "session too large", "auth failed", 
+                   "provider failed", "tool failed", or starts with ⚠️ emoji
+        - Handling: Send as formatted reply to trigger message (🚫 **Fehler** header)
+        - Why: Errors should link visually to user's message for context
+        
+        **Category: "suppress"**
+        - Internal queue and progress messages that clutter chat
+        - Patterns: "gateway queued", "compressing context", "working —", "subagent working"
+        - Handling: Return silently; no message sent to Nextcloud
+        - Why: These are implementation details; users see result, not process
+        
+        **Category: "forward"**
+        - All other messages (default fallback)
+        - Handling: Send as normal bot response with optional replyTo
+        - Why: Safe default; unknown message types never lost
+        
+        Returns:
+            tuple[str, dict[str, Any]]: (category_name, details_dict)
+                - category_name: one of "lifecycle", "error", "suppress", "forward"
+                - details_dict: additional context (e.g., {"text": message, "state": "online"})
+        
+        Example:
+            >>> text = "⚠️ Processing stopped: Model timeout."
+            >>> category, details = adapter._categorize_gateway_message(text)
+            >>> category
+            'error'
+            >>> details
+            {'text': '⚠️ Processing stopped: Model timeout.'}
         """
         if not text:
             return ("forward", {})
@@ -807,6 +839,64 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         reply_to_message_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        """
+        Send a message to a Nextcloud Talk room with intelligent categorization and routing.
+        
+        This is the main message output handler. It categorizes the message using
+        _categorize_gateway_message() and routes to the appropriate handler:
+        
+        **Lifecycle Category:**
+        - Updates bot presence and custom status
+        - Example: Gateway online/offline/draining notifications
+        - Returns: SendResult(success=True) with no message sent to chat
+        
+        **Error Category:**
+        - Sends error message as a reply to the trigger message
+        - Format: "🚫 **Fehler**\n\n{original_error_text}"
+        - Visual linking via replyTo helps users understand what went wrong
+        - Fallback: If no reply_to_message_id, shows error in custom status only
+        - Returns: SendResult with message_id if posted, or fallback status update
+        
+        **Suppress Category:**
+        - Internal messages that clutter chat (queue status, progress)
+        - Example: "gateway queued", "compressing context", "working —"
+        - Returns: SendResult(success=True) silently (no message sent)
+        
+        **Forward Category:**
+        - Normal bot responses and answers
+        - Sent to chat as-is with optional replyTo if available
+        - Returns: SendResult with message_id
+        
+        Args:
+            room_id: Nextcloud Talk room ID to send to
+            text: Message text to categorize and send
+            reply_to_message_id: Optional parent message ID for replyTo linking
+            metadata: Optional additional message metadata (reactions, etc.)
+        
+        Returns:
+            SendResult: success=True with optional message_id
+        
+        Example (1:1 chat, normal response):
+            >>> result = await adapter.send_message("1", "Hello, user!")
+            >>> result.success
+            True
+            >>> result.message_id  # Posted message ID
+            '12345'
+        
+        Example (error with reply_to):
+            >>> result = await adapter.send_message("5", 
+            ...     "⚠️ Processing stopped: timeout",
+            ...     reply_to_message_id="100")
+            >>> result.success
+            True
+            # Message posted as reply to message 100
+        
+        Example (suppress):
+            >>> result = await adapter.send_message("2", "gateway queued: user session")
+            >>> result.success
+            True
+            # No message sent; returns silently
+        """
         if not text:
             return SendResult(success=True)
         

@@ -1,69 +1,243 @@
 # Nextcloud Talk Platform Plugin for Hermes
 
-Standalone Hermes platform plugin for **Nextcloud Talk**.
+Standalone Hermes platform plugin for **Nextcloud Talk** integration.
 
-## What it does
+## Features
 
-- Connects Hermes to Nextcloud Talk as a regular bot user
-- Uses **WebSocket first**, with **HTTP polling fallback**
-- Triggers automatically in 1:1 chats and 2-person rooms
-- Requires `@mention` in group rooms with more than 2 participants
-- Fetches recent room context on demand
-- Sends replies as `replyTo`
-- Downloads attachments to a temp directory
-- Propagates sender identity to Hermes / downstream MCP tools
-- Supports HITL approval via reactions
+- ✅ Connects Hermes as a regular Nextcloud bot user
+- ✅ **WebSocket-first** transport with **HTTP polling fallback**
+- ✅ Automatic triggers in 1:1 chats and 2-person rooms
+- ✅ `@mention`-based triggering in group rooms (>2 participants)
+- ✅ On-demand context fetching (last N messages)
+- ✅ **Intelligent message categorization** (lifecycle, error, suppress, forward)
+- ✅ Sends replies with Nextcloud `replyTo` metadata for visual context linking
+- ✅ Multimodal support: downloads attachments (images, documents) to temp directory
+- ✅ Sender identity propagation to Hermes and downstream MCP tools
+- ✅ Human-in-the-Loop (HITL) approvals via message reactions
+- ✅ Custom presence and status signaling
 
 ## Repository layout
 
-This repo is already packaged as a **standalone Hermes plugin**:
+Standalone Hermes plugin ready for installation:
 
 ```text
 .
 ├── __init__.py
-├── adapter.py
-├── plugin.yaml
-└── tests/
+├── adapter.py              # Core platform adapter with message categorization
+├── plugin.yaml             # Plugin metadata and configuration schema
+├── docs/
+│   └── nextcloud-talk.md   # Extended documentation
+├── tests/
+│   └── test_adapter_contracts.py
+└── README.md               # This file
 ```
 
-Drop the folder into `~/.hermes/plugins/nextcloud-talk/` or add it through the Hermes Dashboard UI.
+Installation: Copy to `~/.hermes/plugins/nextcloud-talk/` or install via Hermes Dashboard UI.
 
-## Required environment variables
+## Quick Start
 
-- `NEXTCLOUD_BASE_URL`
-- `NEXTCLOUD_USERNAME`
-- `NEXTCLOUD_APP_PASSWORD`
+### 1. Environment Setup
 
-## Optional environment variables
+**Required variables:**
 
-- `NEXTCLOUD_ALLOWED_USERS`
-- `NEXTCLOUD_ALLOW_ALL_USERS`
-- `NEXTCLOUD_BOT_HANDLE`
-- `NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS`
-- `NEXTCLOUD_CONTEXT_MESSAGE_LIMIT`
-- `NEXTCLOUD_POLL_INTERVAL_SECONDS`
-- `NEXTCLOUD_ALLOWED_ROOMS`
-- `NEXTCLOUD_ATTACHMENT_TMP_DIR`
-- `NEXTCLOUD_HITL_REQUIRE_REQUESTER`
-- `NEXTCLOUD_HOME_CHANNEL`
-- `NEXTCLOUD_HOME_CHANNEL_NAME`
+```bash
+export NEXTCLOUD_BASE_URL="https://cloud.example.org"
+export NEXTCLOUD_USERNAME="hermes"
+export NEXTCLOUD_APP_PASSWORD="xxxx-yyyy-zzzz-wwww"  # Use app password, not account password
+```
 
-## Local validation
+**Recommended optional variables:**
 
-Run the contract tests:
+```bash
+export NEXTCLOUD_BOT_HANDLE="@hermes"
+export NEXTCLOUD_CONTEXT_MESSAGE_LIMIT="20"
+export NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS="true"
+```
+
+See [Configuration Reference](#configuration-reference) for complete list.
+
+### 2. Installation
+
+```bash
+# Via Hermes Dashboard UI:
+# 1. Navigate to Settings → Plugins
+# 2. Click "Add Plugin"
+# 3. Enter plugin path or repo clone
+# 4. Fill required environment variables
+# 5. Restart Hermes
+
+# Or manually:
+git clone <repo> ~/.hermes/plugins/nextcloud-talk/
+cd ~/.hermes/plugins/nextcloud-talk/
+# Set environment variables
+hermes reload plugins
+```
+
+### 3. Verify Connection
+
+```bash
+# Check Hermes logs for connection success:
+# ✓ nextcloud connected
+# ✓ Using WebSocket|polling transport
+```
+
+## Message Handling
+
+The plugin intelligently categorizes messages for appropriate handling:
+
+### Category A: **Lifecycle** (Status + Presence)
+
+Gateway operational events trigger presence and custom status updates:
+
+- `"Gateway restarting"` → State: `offline`, Custom Status: 🔄 "Gateway restarting"
+- `"Gateway online — Hermes is back"` → State: `online`, Clear custom status
+- `"Draining"` + `"active agent"` → State: `draining`, Custom Status: ⏸️
+
+**Behavior:** Status and presence are updated in Nextcloud; no message sent to chat.
+
+### Category B: **Error** (Reply with Context)
+
+Error messages are formatted and sent as replies to the triggering message:
+
+- Messages starting with `⚠️`
+- Patterns: `"processing stopped"`, `"no response"`, `"session too large"`, `"authentication failed"`, `"provider failed"`, `"tool failed"`, etc.
+
+**Behavior:** 
+- Sent as reply to trigger message (visually linked via `replyTo`)
+- Format: `🚫 **Fehler**\n\n{original_error_message}`
+- If no trigger message exists: shown in custom status only (fallback)
+
+### Category C: **Suppress** (Silent Handling)
+
+Queue and progress messages that clutter the chat are silently suppressed:
+
+- `"gateway queued"`, `"compressing context"`, `"working —"`, `"subagent working"`, `"steer failed"`
+
+**Behavior:** Message never reaches Nextcloud; `SendResult(success=True)` returned silently.
+
+### Category D: **Forward** (Send As-Is)
+
+All other messages sent as normal bot responses:
+
+- Generic responses, answers, acknowledgments
+- Unknown or uncategorized messages (safe fallback)
+
+**Behavior:** Sent to chat as-is with optional `replyTo` if available.
+
+---
+
+## Configuration Reference
+
+### Required environment variables
+
+| Variable | Description | Example |
+| --- | --- | --- |
+| `NEXTCLOUD_BASE_URL` | Nextcloud instance URL | `https://cloud.example.org` |
+| `NEXTCLOUD_USERNAME` | Bot account username | `hermes` |
+| `NEXTCLOUD_APP_PASSWORD` | Bot app password | `xxxx-yyyy-zzzz-wwww` |
+
+### Optional environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `NEXTCLOUD_BOT_HANDLE` | `@{NEXTCLOUD_USERNAME}` | Mention handle for group rooms |
+| `NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS` | `true` | Require bot mention in rooms with >2 participants |
+| `NEXTCLOUD_CONTEXT_MESSAGE_LIMIT` | `20` | Recent messages to fetch on group trigger |
+| `NEXTCLOUD_POLL_INTERVAL_SECONDS` | `3` | Polling interval when WebSocket unavailable |
+| `NEXTCLOUD_ALLOWED_USERS` | (none) | Comma-separated allowed user IDs (allowlist) |
+| `NEXTCLOUD_ALLOW_ALL_USERS` | `false` | Allow all users (dev/testing only) |
+| `NEXTCLOUD_ALLOWED_ROOMS` | (none) | Comma-separated allowed room IDs (allowlist) |
+| `NEXTCLOUD_ATTACHMENT_TMP_DIR` | `/tmp/nc_hermes` | Directory for temporary attachment downloads |
+| `NEXTCLOUD_HITL_REQUIRE_REQUESTER` | `true` | Only original requester can approve/reject reactions |
+| `NEXTCLOUD_HOME_CHANNEL` | (none) | Default room ID for cron/scheduled delivery |
+| `NEXTCLOUD_HOME_CHANNEL_NAME` | (none) | Display name for home channel |
+
+### Room Behavior
+
+- **1:1 chats**: Every message triggers Hermes (no mention required)
+- **2-participant rooms**: Every message triggers Hermes (no mention required)
+- **Group rooms (>2 participants)**: Only messages with bot mention trigger Hermes
+
+### HITL Approvals
+
+Tool execution confirmations use message reactions:
+
+- **Approve**: `✅`, `👍`
+- **Reject**: `❌`, `👎`
+
+Only the original message sender can approve/reject (when `NEXTCLOUD_HITL_REQUIRE_REQUESTER=true`).
+
+---
+
+## Testing
+
+### Run unit tests
 
 ```bash
 python -m unittest -q tests.platforms.nextcloud.test_adapter_contracts
 python -m unittest discover -q
 ```
 
-## Usage notes
+### Manual smoke testing
 
-- Use a dedicated bot account in Nextcloud.
-- Prefer an app password over the account password.
-- For groups, set `NEXTCLOUD_BOT_HANDLE` to the exact mention handle users should use.
-- If WebSocket is not available, the adapter falls back to polling automatically.
+1. Invite the bot user to a 1:1 or group room
+2. Send a message (1:1) or mention the bot (group room)
+3. Verify bot responds in the same room with `replyTo` context
+4. Check Hermes logs: look for `category='forward'|'error'|'suppress'|'lifecycle'` categorization entries
 
-## Status
+---
 
-This plugin is ready to be added via Hermes UI and then connected to a local Nextcloud instance for smoke testing.
+## Best Practices
+
+- **Use app passwords**: Create a dedicated app password for the bot account instead of using the account password
+- **Dedicated bot user**: Use a separate Nextcloud user (e.g., "hermes") for the bot
+- **Custom status**: The plugin manages bot presence and custom status automatically; don't manually change it
+- **Message history**: The plugin does not permanently store chat history; context is fetched on-demand when group rooms trigger
+- **Attachments**: Downloaded to temp directory; cleanup is handled by the OS temp file mechanism
+- **WebSocket**: If WebSocket is unavailable (firewall, network), the adapter automatically falls back to HTTP polling
+
+---
+
+## Architecture Notes
+
+The plugin is structurally similar to the [Matrix platform plugin](https://github.com/NousResearch/hermes-agent/tree/main/plugins/platforms/matrix) but tailored for Nextcloud Talk:
+
+- **Transport abstraction**: WebSocket vs. polling handled transparently
+- **Identity mapping**: Sender user ID passed to Hermes for context-aware tool execution
+- **MCP integration**: User context flows to downstream Nextcloud MCP Server for access-controlled tool execution
+- **Updatefat design**: No dependencies on Hermes core i18n keys; all messages handled generically
+
+For extended documentation, see [docs/nextcloud-talk.md](docs/nextcloud-talk.md).
+
+## Version
+
+- **Plugin version**: 0.1.23
+- **Hermes compatibility**: v0.3.0+
+- **Status**: Production-ready for Nextcloud 25+
+
+## Troubleshooting
+
+### Plugin shows "inactive"
+
+Check config file permissions on server:
+```bash
+ls -la /etc/hermes/config.yaml
+# Should be: hermes:hermes with mode 660 (rw-rw----)
+```
+
+If owned by root, run:
+```bash
+sudo chown hermes:hermes /etc/hermes/config.yaml
+sudo chmod 660 /etc/hermes/config.yaml
+```
+
+### Transport errors in logs
+
+Look for `fallback to polling` or `Connecting via HTTP polling` messages. This is normal if WebSocket is unavailable.
+
+### Bot doesn't respond to mentions
+
+1. Verify bot is in the room
+2. Use exact handle: `@hermes` (check `NEXTCLOUD_BOT_HANDLE` env var)
+3. Check Hermes logs for "No matching message pattern" or categorization entries
+4. Ensure sender user ID is not in `NEXTCLOUD_ALLOWED_USERS` blocklist
