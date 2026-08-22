@@ -136,20 +136,55 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._user_groups_cache: Dict[str, List[str]] = {}
 
     async def _get_user_groups(self, user_id: str) -> List[str]:
-        """Liest die Gruppen eines Nextcloud-Users über die OCS API aus (mit Caching)."""
+        """Return Nextcloud groups using the documented Provisioning API."""
+        user_id = str(user_id or "").strip()
+        if not user_id:
+            return []
+
         if user_id in self._user_groups_cache:
-            return self._user_groups_cache[user_id]
+            return list(self._user_groups_cache[user_id])
 
         try:
-            data = await self._ocs_get(f"cloud/users/{user_id}/groups")
+            session = await self._ensure_session()
+            encoded_user_id = quote(user_id, safe="")
+            path = f"users/{encoded_user_id}/groups"
+            async with session.get(
+                self._cloud_ocs_url(path),
+                params={"format": "json"},
+                headers=self._ocs_headers(),
+            ) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                if "application/json" in content_type:
+                    body = await resp.json()
+                else:
+                    body = {
+                        "ocs": {
+                            "meta": {
+                                "status": "ok",
+                                "statuscode": resp.status,
+                            },
+                            "data": {},
+                        }
+                    }
+
+            self._raise_for_ocs_error(f"cloud/{path}", body)
+            data = self._ocs_data(body)
+
             groups: List[str] = []
-            if isinstance(data, dict) and "groups" in data:
-                groups = [str(g) for g in data["groups"]]
+            if isinstance(data, dict):
+                raw_groups = data.get("groups", [])
+                if isinstance(raw_groups, dict):
+                    raw_groups = raw_groups.get("element", [])
+                if isinstance(raw_groups, list):
+                    groups = [str(g).strip() for g in raw_groups if str(g).strip()]
+                elif raw_groups:
+                    groups = [str(raw_groups).strip()]
             elif isinstance(data, list):
-                groups = [str(g) for g in data]
+                groups = [str(g).strip() for g in data if str(g).strip()]
 
             self._user_groups_cache[user_id] = groups
-            return groups
+            logger.debug("Nextcloud: groups for user %s: %s", user_id, groups)
+            return list(groups)
         except Exception as exc:
             logger.warning("Konnte Gruppen für User %s nicht abfragen: %s", user_id, exc)
             return []
@@ -243,6 +278,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     def _talk_url(self, path: str) -> str:
         return urljoin(f"{self.runtime.base_url}/ocs/v2.php/", path.lstrip("/"))
+
+    def _cloud_ocs_url(self, path: str) -> str:
+        """Build a URL for the core Cloud Provisioning OCS API."""
+        return urljoin(f"{self.runtime.base_url}/ocs/v1.php/cloud/", path.lstrip("/"))
 
     @classmethod
     def _normalized_notice_text(cls, text: str) -> str:
@@ -369,7 +408,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     session_id = await self._mark_room_active(room_id)
                 if not session_id:
                     raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
-                await self._signaling_join_room(ws, room_id, session_id)
+                await self._signaling_join_room(ws, room_id, session_id, settings.user_id)
                 async for msg in ws:
                     if self._stop_event.is_set():
                         return
@@ -617,6 +656,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         # --- ERWEITERUNG ENDE ---
 
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
+        # Hermes' current BasePlatformAdapter.build_source() does not accept
+        # transport-specific extra_headers. Keep the SessionSource compatible
+        # with the core adapter contract and attach optional metadata afterwards.
         source = self.build_source(
             chat_id=room_id,
             chat_name=room_id,
@@ -624,12 +666,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_id,
             message_id=message_id or None,
-            # --- ERWEITERUNG: Context Header für Gateway RBAC ---
-            extra_headers={
+        )
+        try:
+            source.extra_headers = {
                 "X-On-Behalf-Of": sender_id,
                 "X-User-Groups": groups_header_str,
-            },
-        )
+            }
+        except Exception:
+            logger.debug("Nextcloud: SessionSource does not allow extra_headers")
         session_key = self._build_gateway_session_key(source)
         if session_key:
             self._message_session_keys[original_message_id] = {
@@ -654,6 +698,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         event_payload["original_message_id"] = original_message_id
         event_payload["is_edit_event"] = is_edit
         event_payload["is_delete_event"] = is_delete
+        event_payload["user_groups"] = list(user_groups)
         msg_event = MessageEvent(
             text=body,
             message_type=msg_type,
@@ -1172,34 +1217,63 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         session_id = self._active_room_sessions.get(room_id)
         if not session_id:
             session_id = await self._mark_room_active(room_id)
-
         if not session_id:
             return
 
         session = await self._ensure_session()
+        signal_type = "startedTyping" if typing else "stoppedTyping"
+
+        async def _send_once(current_session_id: str) -> None:
+            async with session.ws_connect(
+                self._signaling_ws_url(settings.server),
+                heartbeat=30,
+            ) as ws:
+                await self._signaling_hello(ws, settings)
+                await self._signaling_join_room(
+                    ws,
+                    room_id,
+                    current_session_id,
+                    settings.user_id,
+                )
+                logger.info(
+                    "Nextcloud: emitting typing signal for room %s (%s)",
+                    room_id,
+                    signal_type,
+                )
+                await ws.send_json(
+                    {
+                        "type": "message",
+                        "message": {
+                            "recipient": {"type": "room"},
+                            "data": {"type": signal_type},
+                        },
+                    }
+                )
+
         try:
-            async def _send_typing() -> None:
-                async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
-                    await self._signaling_hello(ws, settings)
-                    await self._signaling_join_room(ws, room_id, session_id)
-                    signal_type = "startedTyping" if typing else "stoppedTyping"
-                    logger.info("Nextcloud: emitting typing signal for room %s (%s)", room_id, signal_type)
-                    await ws.send_json(
-                        {
-                            "type": "message",
-                            "message": {
-                                "recipient": {
-                                    "type": "room",
-                                },
-                                "data": {
-                                    "type": signal_type,
-                                },
-                            },
-                        }
-                    )
-            await asyncio.wait_for(_send_typing(), timeout=5)
-        except Exception as exc:
-            logger.warning("Nextcloud: failed to send typing state for room %s: %s", room_id, exc)
+            await asyncio.wait_for(_send_once(session_id), timeout=5)
+        except Exception as first_exc:
+            # A cached Talk participant session can become stale. This is
+            # especially visible in direct chats because signaling rejects
+            # the old session with no_such_room. Drop it, create a fresh
+            # active session and retry once.
+            logger.debug(
+                "Nextcloud: typing join failed for %s, refreshing active session: %s",
+                room_id,
+                first_exc,
+            )
+            self._active_room_sessions.pop(room_id, None)
+            try:
+                fresh_session_id = await self._mark_room_active(room_id)
+                if not fresh_session_id or fresh_session_id == session_id:
+                    raise first_exc
+                await asyncio.wait_for(_send_once(fresh_session_id), timeout=5)
+            except Exception as exc:
+                logger.warning(
+                    "Nextcloud: failed to send typing state for room %s: %s",
+                    room_id,
+                    exc,
+                )
 
     async def _signaling_hello(self, ws: aiohttp.ClientWebSocketResponse, settings: NextcloudSignalingSettings) -> None:
         hello_version = "2.0" if settings.hello_auth_params.get("2.0") else "1.0"
@@ -1233,6 +1307,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         ws: aiohttp.ClientWebSocketResponse,
         room_id: str,
         session_id: str,
+        user_id: str = "",
     ) -> None:
         await ws.send_json(
             {
@@ -1240,6 +1315,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 "room": {
                     "roomid": room_id,
                     "sessionid": session_id,
+                    **({"userid": user_id} if user_id else {}),
                 },
             }
         )
