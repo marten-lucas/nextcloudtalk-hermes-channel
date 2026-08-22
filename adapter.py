@@ -132,6 +132,27 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._status_text: Dict[str, str] = {}
         self._current_presence_state: Optional[str] = None
         self._current_custom_status: Optional[tuple[Optional[str], str]] = None
+        # --- ERWEITERUNG: User-Gruppen-Cache ---
+        self._user_groups_cache: Dict[str, List[str]] = {}
+
+    async def _get_user_groups(self, user_id: str) -> List[str]:
+        """Liest die Gruppen eines Nextcloud-Users über die OCS API aus (mit Caching)."""
+        if user_id in self._user_groups_cache:
+            return self._user_groups_cache[user_id]
+
+        try:
+            data = await self._ocs_get(f"cloud/users/{user_id}/groups")
+            groups: List[str] = []
+            if isinstance(data, dict) and "groups" in data:
+                groups = [str(g) for g in data["groups"]]
+            elif isinstance(data, list):
+                groups = [str(g) for g in data]
+
+            self._user_groups_cache[user_id] = groups
+            return groups
+        except Exception as exc:
+            logger.warning("Konnte Gruppen für User %s nicht abfragen: %s", user_id, exc)
+            return []
 
     @staticmethod
     def _as_bool(value: Any, default: bool) -> bool:
@@ -233,55 +254,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     @classmethod
     def _categorize_gateway_message(cls, text: str) -> tuple[str, dict[str, Any]]:
-        """
-        Categorize a gateway message for appropriate handling.
-        
-        This method implements updatefat (no i18n keys) message categorization using
-        pattern-based detection. Messages are routed to different handlers based on content:
-        
-        **Category: "lifecycle"**
-        - Gateway operational state changes (online/offline/draining)
-        - Patterns: "gateway restarting", "gateway online — hermes is back", "draining"
-        - Handling: Update custom status and presence; no chat message sent
-        - Why: Administrative events belong in bot presence, not chat
-        
-        **Category: "error"**
-        - Error and failure messages from model/tool execution
-        - Patterns: "processing stopped", "no response", "session too large", "auth failed", 
-                   "provider failed", "tool failed", or starts with ⚠️ emoji
-        - Handling: Send as formatted reply to trigger message (🚫 **Fehler** header)
-        - Why: Errors should link visually to user's message for context
-        
-        **Category: "suppress"**
-        - Internal queue and progress messages that clutter chat
-        - Patterns: "gateway queued", "compressing context", "working —", "subagent working"
-        - Handling: Return silently; no message sent to Nextcloud
-        - Why: These are implementation details; users see result, not process
-        
-        **Category: "forward"**
-        - All other messages (default fallback)
-        - Handling: Send as normal bot response with optional replyTo
-        - Why: Safe default; unknown message types never lost
-        
-        Returns:
-            tuple[str, dict[str, Any]]: (category_name, details_dict)
-                - category_name: one of "lifecycle", "error", "suppress", "forward"
-                - details_dict: additional context (e.g., {"text": message, "state": "online"})
-        
-        Example:
-            >>> text = "⚠️ Processing stopped: Model timeout."
-            >>> category, details = adapter._categorize_gateway_message(text)
-            >>> category
-            'error'
-            >>> details
-            {'text': '⚠️ Processing stopped: Model timeout.'}
-        """
         if not text:
             return ("forward", {})
         
         normalized = " ".join(text.split()).strip().lower()
         
-        # Check for lifecycle events (already handled by _gateway_lifecycle_state)
         if "gateway restarting" in normalized:
             return ("lifecycle", {"state": "offline", "text": text})
         if "gateway online" in normalized and "hermes is back" in normalized:
@@ -289,7 +266,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if "draining" in normalized and "active" in normalized and "agent" in normalized:
             return ("lifecycle", {"state": "draining", "text": text})
         
-        # Check for error messages (start with ⚠️ or contain error patterns)
         if text.strip().startswith("⚠️"):
             return ("error", {"text": text})
         
@@ -307,7 +283,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if any(pattern in normalized for pattern in error_patterns):
             return ("error", {"text": text})
         
-        # Check for messages to suppress (queue/progress)
         suppress_patterns = [
             "gateway.*queued",
             "compressing context",
@@ -320,7 +295,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if any(pattern in normalized for pattern in suppress_patterns):
             return ("suppress", {})
         
-        # Default: forward as normal bot response
         return ("forward", {"text": text})
 
     @staticmethod
@@ -338,8 +312,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if not ws_connected:
             self._start_polling_loop()
         else:
-            # Keep polling as a safety net because some signaling setups
-            # do not emit room chat events reliably for bot-style clients.
             self._start_polling_loop()
         await self._set_presence_status("online")
         await self._clear_custom_status_message(force=True)
@@ -638,6 +610,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 attachment_paths.append(path)
 
         body = self._normalize_nextcloud_command(body)
+
+        # --- ERWEITERUNG START: Gruppen abfragen ---
+        user_groups = await self._get_user_groups(sender_id)
+        groups_header_str = ",".join(user_groups)
+        # --- ERWEITERUNG ENDE ---
+
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
         source = self.build_source(
             chat_id=room_id,
@@ -646,6 +624,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_id,
             message_id=message_id or None,
+            # --- ERWEITERUNG: Context Header für Gateway RBAC ---
+            extra_headers={
+                "X-On-Behalf-Of": sender_id,
+                "X-User-Groups": groups_header_str,
+            },
         )
         session_key = self._build_gateway_session_key(source)
         if session_key:
@@ -839,72 +822,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         reply_to_message_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """
-        Send a message to a Nextcloud Talk room with intelligent categorization and routing.
-        
-        This is the main message output handler. It categorizes the message using
-        _categorize_gateway_message() and routes to the appropriate handler:
-        
-        **Lifecycle Category:**
-        - Updates bot presence and custom status
-        - Example: Gateway online/offline/draining notifications
-        - Returns: SendResult(success=True) with no message sent to chat
-        
-        **Error Category:**
-        - Sends error message as a reply to the trigger message
-        - Format: "🚫 **Fehler**\n\n{original_error_text}"
-        - Visual linking via replyTo helps users understand what went wrong
-        - Fallback: If no reply_to_message_id, shows error in custom status only
-        - Returns: SendResult with message_id if posted, or fallback status update
-        
-        **Suppress Category:**
-        - Internal messages that clutter chat (queue status, progress)
-        - Example: "gateway queued", "compressing context", "working —"
-        - Returns: SendResult(success=True) silently (no message sent)
-        
-        **Forward Category:**
-        - Normal bot responses and answers
-        - Sent to chat as-is with optional replyTo if available
-        - Returns: SendResult with message_id
-        
-        Args:
-            room_id: Nextcloud Talk room ID to send to
-            text: Message text to categorize and send
-            reply_to_message_id: Optional parent message ID for replyTo linking
-            metadata: Optional additional message metadata (reactions, etc.)
-        
-        Returns:
-            SendResult: success=True with optional message_id
-        
-        Example (1:1 chat, normal response):
-            >>> result = await adapter.send_message("1", "Hello, user!")
-            >>> result.success
-            True
-            >>> result.message_id  # Posted message ID
-            '12345'
-        
-        Example (error with reply_to):
-            >>> result = await adapter.send_message("5", 
-            ...     "⚠️ Processing stopped: timeout",
-            ...     reply_to_message_id="100")
-            >>> result.success
-            True
-            # Message posted as reply to message 100
-        
-        Example (suppress):
-            >>> result = await adapter.send_message("2", "gateway queued: user session")
-            >>> result.success
-            True
-            # No message sent; returns silently
-        """
         if not text:
             return SendResult(success=True)
         
-        # Categorize the message to determine how to handle it
         category, details = self._categorize_gateway_message(text)
         
         if category == "lifecycle":
-            # Lifecycle events: update custom status and presence
             state = details.get("state")
             if state == "offline":
                 await self._set_custom_status_message("Gateway restarting", "🔄")
@@ -913,19 +836,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 await self._set_presence_status("online")
                 await self._clear_custom_status_message()
             elif state == "draining":
-                # Show draining message in custom status
                 msg = details.get("text", "Gateway draining")
                 await self._set_custom_status_message(msg[:140], "⏸️")
             return SendResult(success=True)
         
         elif category == "error":
-            # Error messages: send as reply if we have the trigger message ID
             if not reply_to_message_id:
-                # Fallback: show error in custom status only
                 await self._set_custom_status_message("Fehler", "⚠️")
                 return SendResult(success=True)
             
-            # Send error as reply to the trigger message
             error_text = details.get("text", text)
             formatted = f"🚫 **Fehler**\n\n{error_text}"
             await self._mark_room_active(room_id)
@@ -942,11 +861,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return SendResult(success=True, message_id=message_id)
         
         elif category == "suppress":
-            # Suppress queue/progress messages (return silently)
             return SendResult(success=True)
         
         else:  # category == "forward"
-            # Normal bot response: send as-is
             await self._mark_room_active(room_id)
             payload: Dict[str, Any] = {"message": text}
             if reply_to_message_id:
@@ -1086,7 +1003,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             quoted_path = quote(remote_path.lstrip("/"))
             url = f"{self.runtime.base_url}/remote.php/dav/files/{quote(self.runtime.username)}/{quoted_path}"
         if not url and file_id:
-            url = self._talk_url(f"apps/spreed/api/v1/chat/file/{file_id}")
+            url = self._talk_url(f"apps/spreed/api/v1/chat/{file_id}")
         if not url:
             return None
 
@@ -1308,7 +1225,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     return
                 if payload.get("type") == "error":
                     raise RuntimeError(f"Nextcloud signaling hello failed: {payload}")
-            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 raise RuntimeError("Nextcloud signaling websocket closed during hello")
 
     async def _signaling_join_room(
@@ -1334,7 +1251,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     return
                 if payload.get("type") == "error":
                     raise RuntimeError(f"Nextcloud signaling room join failed: {payload}")
-            elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                 raise RuntimeError("Nextcloud signaling websocket closed during room join")
 
 
