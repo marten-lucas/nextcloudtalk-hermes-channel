@@ -342,16 +342,20 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         suffix = path.strip("/")
         return f"{base}/{suffix}" if suffix else base
 
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
+   async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
             raise RuntimeError("Nextcloud adapter not configured: base_url/username/app_password required")
         self._stop_event.clear()
         await self._ensure_session()
         ws_connected = await self._connect_websocket_once()
+        
+        # Nur auf Polling zurückfallen, wenn WebSocket NICHT verbunden werden konnte
         if not ws_connected:
+            logger.info("Nextcloud: Nutze Polling-Fallback.")
             self._start_polling_loop()
         else:
-            self._start_polling_loop()
+            logger.info("Nextcloud: WebSocket-Signaling erfolgreich gestartet.")
+
         await self._set_presence_status("online")
         await self._clear_custom_status_message(force=True)
         return True
@@ -398,7 +402,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             logger.warning("Nextcloud: websocket signaling unavailable, falling back to polling")
         return started_any
 
-    async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingSettings) -> None:
+async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingSettings) -> None:
         session = await self._ensure_session()
         try:
             async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
@@ -429,10 +433,17 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                             await self.handle_incoming_event(event_payload)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:
+        except (aiohttp.ClientError, RuntimeError, Exception) as exc:
             if not self._stop_event.is_set():
-                logger.warning("Nextcloud websocket room loop ended unexpectedly for %s: %s", room_id, exc)
-                self._start_polling_loop()
+                err_str = str(exc)
+                if "closing transport" in err_str or "closed" in err_str:
+                    logger.debug("Nextcloud websocket transport closed for %s: %s", room_id, exc)
+                else:
+                    logger.warning("Nextcloud websocket room loop ended for %s: %s", room_id, exc)
+                
+                # Polling-Fallback nur aktivieren, wenn kein anderer WebSocket-Task mehr aktiv ist
+                if not self._room_ws_tasks:
+                    self._start_polling_loop()
         finally:
             self._room_ws_tasks.pop(room_id, None)
 
