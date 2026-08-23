@@ -6,8 +6,8 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urljoin
@@ -132,8 +132,17 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._status_text: Dict[str, str] = {}
         self._current_presence_state: Optional[str] = None
         self._current_custom_status: Optional[tuple[Optional[str], str]] = None
-        # --- ERWEITERUNG: User-Gruppen-Cache ---
         self._user_groups_cache: Dict[str, List[str]] = {}
+
+    @property
+    def is_connected(self) -> bool:
+        """Prüft, ob der Adapter aktiv mit Nextcloud verbunden ist."""
+        return bool(
+            self._session
+            and not self._session.closed
+            and not self._stop_event.is_set()
+            and (bool(self._room_ws_tasks) or (self._polling_task is not None and not self._polling_task.done()))
+        )
 
     async def _get_user_groups(self, user_id: str) -> List[str]:
         """Return Nextcloud groups using the documented Provisioning API."""
@@ -273,7 +282,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         return self._session
 
     def _ws_url(self) -> str:
-        # Placeholder endpoint; tune for concrete HPB deployment.
         return f"{self.runtime.base_url}/apps/spreed/ws"
 
     def _talk_url(self, path: str) -> str:
@@ -342,14 +350,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         suffix = path.strip("/")
         return f"{base}/{suffix}" if suffix else base
 
-   async def connect(self, *, is_reconnect: bool = False) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         if not self.runtime.base_url or not self.runtime.username or not self.runtime.app_password:
             raise RuntimeError("Nextcloud adapter not configured: base_url/username/app_password required")
         self._stop_event.clear()
         await self._ensure_session()
         ws_connected = await self._connect_websocket_once()
         
-        # Nur auf Polling zurückfallen, wenn WebSocket NICHT verbunden werden konnte
         if not ws_connected:
             logger.info("Nextcloud: Nutze Polling-Fallback.")
             self._start_polling_loop()
@@ -402,7 +409,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             logger.warning("Nextcloud: websocket signaling unavailable, falling back to polling")
         return started_any
 
-async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingSettings) -> None:
+    async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingSettings) -> None:
         session = await self._ensure_session()
         try:
             async with session.ws_connect(self._signaling_ws_url(settings.server), heartbeat=30) as ws:
@@ -441,7 +448,6 @@ async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingS
                 else:
                     logger.warning("Nextcloud websocket room loop ended for %s: %s", room_id, exc)
                 
-                # Polling-Fallback nur aktivieren, wenn kein anderer WebSocket-Task mehr aktiv ist
                 if not self._room_ws_tasks:
                     self._start_polling_loop()
         finally:
@@ -668,9 +674,6 @@ async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingS
         # --- ERWEITERUNG ENDE ---
 
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
-        # Hermes' current BasePlatformAdapter.build_source() does not accept
-        # transport-specific extra_headers. Keep the SessionSource compatible
-        # with the core adapter contract and attach optional metadata afterwards.
         source = self.build_source(
             chat_id=room_id,
             chat_name=room_id,
@@ -1265,10 +1268,6 @@ async def _room_signaling_loop(self, room_id: str, settings: NextcloudSignalingS
         try:
             await asyncio.wait_for(_send_once(session_id), timeout=5)
         except Exception as first_exc:
-            # A cached Talk participant session can become stale. This is
-            # especially visible in direct chats because signaling rejects
-            # the old session with no_such_room. Drop it, create a fresh
-            # active session and retry once.
             logger.debug(
                 "Nextcloud: typing join failed for %s, refreshing active session: %s",
                 room_id,
@@ -1421,6 +1420,12 @@ async def standalone_send(
         await adapter.disconnect()
 
 
+def check_is_connected(adapter_or_config: Any) -> bool:
+    if hasattr(adapter_or_config, "is_connected"):
+        return bool(adapter_or_config.is_connected)
+    return validate_nextcloud_config(adapter_or_config)
+
+
 def register(ctx: Any) -> None:
     """Hermes plugin entry point."""
     ctx.register_platform(
@@ -1429,7 +1434,7 @@ def register(ctx: Any) -> None:
         adapter_factory=_build_adapter,
         check_fn=nextcloud_deps_present,
         validate_config=validate_nextcloud_config,
-        is_connected=validate_nextcloud_config,
+        is_connected=check_is_connected,
         required_env=[
             "NEXTCLOUD_BASE_URL",
             "NEXTCLOUD_USERNAME",
