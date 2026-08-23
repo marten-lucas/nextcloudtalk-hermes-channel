@@ -653,6 +653,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         # --- ERWEITERUNG START: Gruppen abfragen ---
         user_groups = await self._get_user_groups(sender_id)
         groups_header_str = ",".join(user_groups)
+        logger.warning("RBAC Header gesetzt: User=%s, Groups=%s", sender_id, groups_header_str)
         # --- ERWEITERUNG ENDE ---
 
         msg_type = MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT
