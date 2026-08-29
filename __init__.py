@@ -1,3 +1,3 @@
-from .adapter import register
+from .adapter import NextcloudTalkPlatform, register
 
-__all__ = ["register"]
+__all__ = ["NextcloudTalkPlatform", "register"]
