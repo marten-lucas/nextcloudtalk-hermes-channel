@@ -1,6 +1,7 @@
-import asyncio
+yimport asyncio
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import adapter as nextcloud_adapter_module
 from adapter import NextcloudTalkPlatform
@@ -94,6 +95,22 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(adapter.received_events), 1)
         self.assertEqual(adapter.received_events[0].source["user_id"], "kassier")
+
+    async def test_identity_headers_use_human_source_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-identity"] = 2
+        adapter._get_user_groups = AsyncMock(return_value=["admin", "kiga_board"])
+
+        await adapter.handle_incoming_event(
+            {"room_id": "room-identity", "id": "m-id", "actorId": "vorstand", "message": "Bitte helfen"}
+        )
+
+        self.assertEqual(len(adapter.received_events), 1)
+        self.assertEqual("vorstand", adapter.received_events[0].source["user_id"])
+        self.assertEqual("vorstand", adapter.received_events[0].source["extra_headers"]["X-On-Behalf-Of"])
+        self.assertEqual("admin,kiga_board", adapter.received_events[0].source["extra_headers"]["X-User-Groups"])
 
     async def test_two_participant_room_always_triggers_contract(self):
         adapter = TestableNextcloudTalkPlatform(

@@ -683,10 +683,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             message_id=message_id or None,
         )
         try:
-            source.extra_headers = {
-                "X-On-Behalf-Of": sender_id,
-                "X-User-Groups": groups_header_str,
-            }
+            if isinstance(source, dict):
+                source["extra_headers"] = {
+                    "X-On-Behalf-Of": sender_id,
+                    "X-User-Groups": groups_header_str,
+                }
+            else:
+                source.extra_headers = {
+                    "X-On-Behalf-Of": sender_id,
+                    "X-User-Groups": groups_header_str,
+                }
         except Exception:
             logger.debug("Nextcloud: SessionSource does not allow extra_headers")
         session_key = self._build_gateway_session_key(source)
