@@ -9,6 +9,16 @@ import aiohttp
 logger = logging.getLogger(__name__)
 
 
+class NextcloudOCSException(Exception):
+    """Custom exception for Nextcloud OCS API errors containing status code, message, and path."""
+
+    def __init__(self, status_code: int, message: str, path: str):
+        self.status_code = status_code
+        self.message = message
+        self.path = path
+        super().__init__(f"Nextcloud OCS request failed for {path}: {status_code} {message}")
+
+
 class NextcloudTalkClient:
     """Reiner HTTP-Client für Nextcloud OCS REST APIs."""
 
@@ -91,7 +101,8 @@ class NextcloudTalkClient:
         query = {"format": "json"}
         if params:
             query.update(params)
-        request_fn = getattr(session, method)
+        method_lower = method.lower()
+        request_fn = getattr(session, method_lower)
         async with request_fn(self.talk_url(path), params=query, data=data, headers=self.ocs_headers()) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "application/json" in content_type:
@@ -109,4 +120,4 @@ class NextcloudTalkClient:
         status_code = int(meta.get("statuscode", 100))
         if status != "ok" or status_code >= 400:
             message = meta.get("message", "unknown OCS error")
-            raise RuntimeError(f"Nextcloud OCS request failed for {path}: {status_code} {message}")
+            raise NextcloudOCSException(status_code=status_code, message=message, path=path)
