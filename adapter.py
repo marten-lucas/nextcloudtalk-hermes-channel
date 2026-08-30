@@ -311,14 +311,26 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self,
         event: Dict[str, Any],
     ) -> None:
+        # 1. Native Nextcloud Actor-Type & SystemMessage Flags auswerten
+        actor_type = str(event.get("actorType") or event.get("actor_type") or "").strip().lower()
+        if actor_type and actor_type != "users":
+            logger.debug(f"Nextcloud: Ignoriere Nachricht von Nicht-User Actor (actor_type={actor_type})")
+            return
+
+        is_delete = "delete" in str(event.get("eventType", "")).lower()
+        if (event.get("systemMessage") or event.get("system_message")) and not is_delete:
+            logger.debug("Nextcloud: Ignoriere native SystemMessage.")
+            return
+
         sender_id = str(
             event.get("actorId")
             or event.get("actor_id")
             or event.get("sender")
+            or event.get("userId")
             or ""
         )
 
-        # 1. Ignoriere eigene Nachrichten, leere Absender sowie System-Konto
+        # 2. Ignoriere eigene Nachrichten, leere Absender sowie reservierte System-Accounts
         if (
             not sender_id
             or sender_id == self.runtime.username
@@ -332,8 +344,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             or ""
         )
 
-        # 2. Ignoriere systemgenerierte Nachrichten-Muster & Platzhalter
-        if "{actor}" in body or "Das System hat" in body:
+        # 3. Ignoriere systemgenerierte Nachrichten-Muster & Platzhalter
+        if (
+            "{actor}" in body
+            or "Das System hat" in body
+            or "Gesprächseinstellungen verwalten" in body
+            or "Unterhaltungsinformationen bearbeiten" in body
+        ):
+            logger.debug(f"Nextcloud: Ignoriere automatische System-Textnachricht: {body[:30]}...")
             return
 
         groups = await self.identity_mgr.get_user_groups(
