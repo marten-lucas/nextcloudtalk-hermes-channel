@@ -8,9 +8,9 @@ logger = logging.getLogger(__name__)
 class NextcloudIdentityManager:
     """Manages identity mapping and group caching for Nextcloud users."""
 
-    def __init__(self, client, cache_ttl: int = 120):
+    def __init__(self, client, cache_ttl_seconds: int = 120):
         self.client = client
-        self.cache_ttl = cache_ttl
+        self.cache_ttl_seconds = cache_ttl_seconds
         self._group_cache: Dict[str, tuple[float, Set[str]]] = {}
 
     async def get_user_groups(self, user_id: str) -> Set[str]:
@@ -21,7 +21,7 @@ class NextcloudIdentityManager:
         now = time.time()
         if user_id in self._group_cache:
             timestamp, groups = self._group_cache[user_id]
-            if now - timestamp < self.cache_ttl:
+            if now - timestamp < self.cache_ttl_seconds:
                 return groups
 
         try:
@@ -29,7 +29,7 @@ class NextcloudIdentityManager:
             response = await self.client._ocs_request(
                 "GET", f"/cloud/users/{user_id}/groups"
             )
-            
+
             # OCS Response Parsing
             if isinstance(response, dict):
                 data = response.get("ocs", {}).get("data", {})
