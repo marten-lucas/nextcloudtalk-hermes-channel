@@ -1,4 +1,3 @@
-```python
 from __future__ import annotations
 
 import asyncio
@@ -576,4 +575,3 @@ def register(ctx: Any) -> None:
         max_message_length=16000,
         emoji="☁️",
     )
-```
