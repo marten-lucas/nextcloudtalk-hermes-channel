@@ -318,7 +318,22 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             or ""
         )
 
-        if not sender_id or sender_id == self.runtime.username:
+        # 1. Ignoriere eigene Nachrichten, leere Absender sowie System-Konto
+        if (
+            not sender_id
+            or sender_id == self.runtime.username
+            or sender_id.lower() in {"system", "changelog", "sample"}
+        ):
+            return
+
+        body = str(
+            event.get("message")
+            or event.get("text")
+            or ""
+        )
+
+        # 2. Ignoriere systemgenerierte Nachrichten-Muster & Platzhalter
+        if "{actor}" in body or "Das System hat" in body:
             return
 
         groups = await self.identity_mgr.get_user_groups(
@@ -333,12 +348,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         room_id = str(
             event.get("room_id")
             or event.get("token")
-            or ""
-        )
-
-        body = str(
-            event.get("message")
-            or event.get("text")
             or ""
         )
 
