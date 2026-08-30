@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .attachments import NextcloudAttachmentManager
-from .client import NextcloudTalkClient
+from .client import NextcloudOCSException, NextcloudTalkClient
 from .hitl import HITLManager
 from .identity import NextcloudIdentityManager
 from .presence import NextcloudPresenceManager
@@ -375,14 +375,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """
-        Hermes BasePlatformAdapter contract.
-
-        The actual Nextcloud Talk implementation remains in
-        send_message(); this method provides the interface expected
-        by the current Hermes gateway.
-        """
-
+        """Hermes BasePlatformAdapter contract."""
         return await self.send_message(
             room_id=chat_id,
             text=content,
@@ -397,6 +390,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         reply_to_message_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        if not text or not text.strip():
+            logger.warning(f"Senden einer leeren Nachricht an Raum '{room_id}' abgebrochen.")
+            return SendResult(success=False, error="Empty message")
+
         payload: Dict[str, Any] = {
             "message": text,
         }
@@ -404,34 +401,56 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if reply_to_message_id:
             payload["replyTo"] = reply_to_message_id
 
-        data = await self.client.ocs_post(
-            f"apps/spreed/api/v1/chat/{room_id}",
-            payload,
-        )
+        try:
+            data = await self.client.ocs_post(
+                f"apps/spreed/api/v1/chat/{room_id}",
+                payload,
+            )
 
-        msg_id = (
-            str(data.get("id", ""))
-            if isinstance(data, dict)
-            else None
-        )
+            msg_id = (
+                str(data.get("id", ""))
+                if isinstance(data, dict)
+                else None
+            )
 
-        return SendResult(
-            success=True,
-            message_id=msg_id,
-        )
+            return SendResult(
+                success=True,
+                message_id=msg_id,
+            )
+
+        except NextcloudOCSException as e:
+            if e.status_code == 403:
+                logger.error(
+                    f"[Nextcloud Talk] Keine Sendeberechtigung im Raum '{room_id}' (HTTP 403)."
+                )
+            elif e.status_code == 400:
+                logger.error(
+                    f"[Nextcloud Talk] Ungültiger Payload beim Senden an Raum '{room_id}' (HTTP 400)."
+                )
+            else:
+                logger.error(
+                    f"[Nextcloud Talk] OCS-Fehler {e.status_code} beim Senden an Raum '{room_id}': {e.message}"
+                )
+
+            return SendResult(
+                success=False,
+                error=f"OCS Error {e.status_code}: {e.message}",
+            )
+
+        except Exception as exc:
+            logger.exception(
+                f"[Nextcloud Talk] Unerwarteter Fehler beim Senden an Raum '{room_id}': {exc}"
+            )
+            return SendResult(
+                success=False,
+                error=str(exc),
+            )
 
     async def get_chat_info(
         self,
         chat_id: str,
     ) -> Dict[str, Any]:
-        """
-        Hermes BasePlatformAdapter contract.
-
-        Resolve a Nextcloud Talk room from the currently joined
-        rooms. If the room cannot be resolved, return a stable
-        fallback identity rather than breaking session handling.
-        """
-
+        """Hermes BasePlatformAdapter contract."""
         chat_id = str(chat_id or "").strip()
 
         if not chat_id:
@@ -495,8 +514,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         except Exception as exc:
             logger.warning(
-                "Nextcloud Talk: get_chat_info(%s) "
-                "konnte Raumdaten nicht laden: %s",
+                "Nextcloud Talk: get_chat_info(%s) konnte Raumdaten nicht laden: %s",
                 chat_id,
                 exc,
             )
