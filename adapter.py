@@ -1,3 +1,4 @@
+```python
 from __future__ import annotations
 
 import asyncio
@@ -15,7 +16,9 @@ from .identity import NextcloudIdentityManager
 from .presence import NextcloudPresenceManager
 from .signaling import NextcloudSignalingManager
 
+
 logger = logging.getLogger(__name__)
+
 
 try:
     from gateway.config import Platform, PlatformConfig  # type: ignore
@@ -63,7 +66,11 @@ except Exception:
         async def handle_message(self, event: MessageEvent) -> None:
             return None
 
-        async def cancel_session_processing(self, session_key: str, **_: Any) -> None:
+        async def cancel_session_processing(
+            self,
+            session_key: str,
+            **_: Any,
+        ) -> None:
             return None
 
         def _mark_disconnected(self) -> None:
@@ -91,10 +98,19 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("nextcloud"))
+
         extra = getattr(config, "extra", {}) or {}
 
-        base_url = str(extra.get("base_url") or os.getenv("NEXTCLOUD_BASE_URL", "")).rstrip("/")
-        username = str(extra.get("username") or os.getenv("NEXTCLOUD_USERNAME", ""))
+        base_url = str(
+            extra.get("base_url")
+            or os.getenv("NEXTCLOUD_BASE_URL", "")
+        ).rstrip("/")
+
+        username = str(
+            extra.get("username")
+            or os.getenv("NEXTCLOUD_USERNAME", "")
+        )
+
         app_password = str(
             extra.get("app_password")
             or getattr(config, "token", "")
@@ -105,29 +121,63 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             base_url=base_url,
             username=username,
             app_password=app_password,
-            bot_handle=str(extra.get("bot_handle") or os.getenv("NEXTCLOUD_BOT_HANDLE", "")).strip()
+            bot_handle=str(
+                extra.get("bot_handle")
+                or os.getenv("NEXTCLOUD_BOT_HANDLE", "")
+            ).strip()
             or f"@{username}",
             require_mention_in_groups=str(
                 extra.get("require_mention_in_groups")
-                or os.getenv("NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS", "true")
+                or os.getenv(
+                    "NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS",
+                    "true",
+                )
             ).lower()
             in {"1", "true", "yes"},
             context_message_limit=int(
-                extra.get("context_message_limit") or os.getenv("NEXTCLOUD_CONTEXT_MESSAGE_LIMIT", 20)
+                extra.get("context_message_limit")
+                or os.getenv(
+                    "NEXTCLOUD_CONTEXT_MESSAGE_LIMIT",
+                    20,
+                )
             ),
             poll_interval_seconds=float(
-                extra.get("poll_interval_seconds") or os.getenv("NEXTCLOUD_POLL_INTERVAL_SECONDS", 3.0)
+                extra.get("poll_interval_seconds")
+                or os.getenv(
+                    "NEXTCLOUD_POLL_INTERVAL_SECONDS",
+                    3.0,
+                )
             ),
         )
 
-        self.client = NextcloudTalkClient(base_url, username, app_password)
-        self.identity_mgr = NextcloudIdentityManager(self.client, cache_ttl_seconds=120)
-        self.hitl_mgr = HITLManager(enforce_requester_only=self.runtime.hitl_require_requester)
-        self.presence_mgr = NextcloudPresenceManager(self.client)
-        self.attachment_mgr = NextcloudAttachmentManager(
-            self.client, tmp_dir=self.runtime.attachment_tmp_dir
+        self.client = NextcloudTalkClient(
+            base_url,
+            username,
+            app_password,
         )
-        self.signaling_mgr = NextcloudSignalingManager(self.client, self.handle_incoming_event)
+
+        self.identity_mgr = NextcloudIdentityManager(
+            self.client,
+            cache_ttl_seconds=120,
+        )
+
+        self.hitl_mgr = HITLManager(
+            enforce_requester_only=self.runtime.hitl_require_requester
+        )
+
+        self.presence_mgr = NextcloudPresenceManager(
+            self.client
+        )
+
+        self.attachment_mgr = NextcloudAttachmentManager(
+            self.client,
+            tmp_dir=self.runtime.attachment_tmp_dir,
+        )
+
+        self.signaling_mgr = NextcloudSignalingManager(
+            self.client,
+            self.handle_incoming_event,
+        )
 
         self._stop_event = asyncio.Event()
         self._polling_task: Optional[asyncio.Task[None]] = None
@@ -138,72 +188,160 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     def is_connected(self) -> bool:
         return not self._stop_event.is_set()
 
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
+    async def connect(
+        self,
+        *,
+        is_reconnect: bool = False,
+    ) -> bool:
         self._stop_event.clear()
-        await self.client.ensure_session()
-        await self.presence_mgr.set_presence_status("online")
-        await self.presence_mgr.clear_custom_status_message(force=True)
 
-        self._polling_task = asyncio.create_task(self._polling_loop())
-        logger.info("Nextcloud Talk: Adapter erfolgreich verbunden.")
+        await self.client.ensure_session()
+
+        await self.presence_mgr.set_presence_status(
+            "online"
+        )
+
+        await self.presence_mgr.clear_custom_status_message(
+            force=True
+        )
+
+        self._polling_task = asyncio.create_task(
+            self._polling_loop()
+        )
+
+        logger.info(
+            "Nextcloud Talk: Adapter erfolgreich verbunden."
+        )
+
         return True
 
     async def disconnect(self) -> None:
         self._stop_event.set()
+
         if self._polling_task:
             self._polling_task.cancel()
-        await self.presence_mgr.set_presence_status("offline")
+            self._polling_task = None
+
+        await self.presence_mgr.set_presence_status(
+            "offline"
+        )
+
         await self.client.close()
+
         self._mark_disconnected()
 
     async def _polling_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 rooms = await self.client.ocs_get(
-                    "apps/spreed/api/v4/room", params={"includeStatus": "true"}
+                    "apps/spreed/api/v4/room",
+                    params={"includeStatus": "true"},
                 )
+
                 if isinstance(rooms, list):
                     for room in rooms:
-                        room_id = str(room.get("token", "") or room.get("id", ""))
-                        if room_id:
-                            events = await self._fetch_room_events(room_id)
-                            for event in events:
-                                await self.handle_incoming_event(event)
+                        room_id = str(
+                            room.get("token", "")
+                            or room.get("id", "")
+                        )
+
+                        if not room_id:
+                            continue
+
+                        events = await self._fetch_room_events(
+                            room_id
+                        )
+
+                        for event in events:
+                            await self.handle_incoming_event(
+                                event
+                            )
+
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:
-                logger.warning("Nextcloud Polling Fehler: %s", exc)
-            await asyncio.sleep(self.runtime.poll_interval_seconds)
 
-    async def _fetch_room_events(self, room_id: str) -> List[Dict[str, Any]]:
-        params: Dict[str, Any] = {"lookIntoFuture": 0, "limit": 50}
+            except Exception as exc:
+                logger.warning(
+                    "Nextcloud Polling Fehler: %s",
+                    exc,
+                )
+
+            await asyncio.sleep(
+                self.runtime.poll_interval_seconds
+            )
+
+    async def _fetch_room_events(
+        self,
+        room_id: str,
+    ) -> List[Dict[str, Any]]:
+        params: Dict[str, Any] = {
+            "lookIntoFuture": 0,
+            "limit": 50,
+        }
+
         if room_id in self._poll_cursor_by_room:
             params["lookIntoFuture"] = 1
-            params["lastKnownMessageId"] = self._poll_cursor_by_room[room_id]
+            params["lastKnownMessageId"] = (
+                self._poll_cursor_by_room[room_id]
+            )
 
-        data = await self.client.ocs_get(f"apps/spreed/api/v1/chat/{room_id}", params=params)
+        data = await self.client.ocs_get(
+            f"apps/spreed/api/v1/chat/{room_id}",
+            params=params,
+        )
+
         events: List[Dict[str, Any]] = []
+
         if isinstance(data, list):
             for event in data:
                 normalized = dict(event)
-                normalized.setdefault("room_id", room_id)
+                normalized.setdefault(
+                    "room_id",
+                    room_id,
+                )
+
                 events.append(normalized)
-                self._poll_cursor_by_room[room_id] = str(event.get("id", ""))
+
+                self._poll_cursor_by_room[room_id] = str(
+                    event.get("id", "")
+                )
+
         return events
 
-    async def handle_incoming_event(self, event: Dict[str, Any]) -> None:
-        sender_id = str(event.get("actorId") or event.get("actor_id") or event.get("sender") or "")
+    async def handle_incoming_event(
+        self,
+        event: Dict[str, Any],
+    ) -> None:
+        sender_id = str(
+            event.get("actorId")
+            or event.get("actor_id")
+            or event.get("sender")
+            or ""
+        )
+
         if not sender_id or sender_id == self.runtime.username:
             return
 
-        # 1. Gruppen mit TTL-Cache laden
-        groups = await self.identity_mgr.get_user_groups(sender_id)
+        groups = await self.identity_mgr.get_user_groups(
+            sender_id
+        )
 
-        # 2. ContextVars für Outbound HTTP MCP/Honcho injizieren
-        self.identity_mgr.set_contextvars_identity(sender_id, groups)
+        self.identity_mgr.set_contextvars_identity(
+            sender_id,
+            groups,
+        )
 
-        room_id = str(event.get("room_id") or event.get("token") or "")
-        body = str(event.get("message") or event.get("text") or "")
+        room_id = str(
+            event.get("room_id")
+            or event.get("token")
+            or ""
+        )
+
+        body = str(
+            event.get("message")
+            or event.get("text")
+            or ""
+        )
 
         source = self.build_source(
             chat_id=room_id,
@@ -212,6 +350,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_id,
         )
+
         if isinstance(source, dict):
             source["extra_headers"] = {
                 "X-On-Behalf-Of": sender_id,
@@ -227,7 +366,30 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_id=sender_id,
             user_name=sender_id,
         )
+
         await self.handle_message(msg_event)
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """
+        Hermes BasePlatformAdapter contract.
+
+        The actual Nextcloud Talk implementation remains in
+        send_message(); this method provides the interface expected
+        by the current Hermes gateway.
+        """
+
+        return await self.send_message(
+            room_id=chat_id,
+            text=content,
+            reply_to_message_id=reply_to,
+            metadata=metadata,
+        )
 
     async def send_message(
         self,
@@ -236,38 +398,166 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         reply_to_message_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        payload: Dict[str, Any] = {"message": text}
+        payload: Dict[str, Any] = {
+            "message": text,
+        }
+
         if reply_to_message_id:
             payload["replyTo"] = reply_to_message_id
-        data = await self.client.ocs_post(f"apps/spreed/api/v1/chat/{room_id}", payload)
-        msg_id = str(data.get("id", "")) if isinstance(data, dict) else None
-        return SendResult(success=True, message_id=msg_id)
+
+        data = await self.client.ocs_post(
+            f"apps/spreed/api/v1/chat/{room_id}",
+            payload,
+        )
+
+        msg_id = (
+            str(data.get("id", ""))
+            if isinstance(data, dict)
+            else None
+        )
+
+        return SendResult(
+            success=True,
+            message_id=msg_id,
+        )
+
+    async def get_chat_info(
+        self,
+        chat_id: str,
+    ) -> Dict[str, Any]:
+        """
+        Hermes BasePlatformAdapter contract.
+
+        Resolve a Nextcloud Talk room from the currently joined
+        rooms. If the room cannot be resolved, return a stable
+        fallback identity rather than breaking session handling.
+        """
+
+        chat_id = str(chat_id or "").strip()
+
+        if not chat_id:
+            return {
+                "name": "",
+                "type": "group",
+            }
+
+        try:
+            rooms = await self.client.ocs_get(
+                "apps/spreed/api/v4/room",
+                params={"includeStatus": "true"},
+            )
+
+            if isinstance(rooms, list):
+                for room in rooms:
+                    room_id = str(
+                        room.get("token", "")
+                        or room.get("id", "")
+                    )
+
+                    if room_id != chat_id:
+                        continue
+
+                    name = str(
+                        room.get("displayName")
+                        or room.get("name")
+                        or room.get("description")
+                        or chat_id
+                    )
+
+                    raw_type = str(
+                        room.get("type", "")
+                    ).lower()
+
+                    if raw_type in {
+                        "one-to-one",
+                        "one_to_one",
+                        "one-to-one-room",
+                        "dm",
+                        "direct",
+                        "direct-message",
+                    }:
+                        room_type = "dm"
+                    elif raw_type in {
+                        "public",
+                        "public-room",
+                        "channel",
+                        "public-channel",
+                    }:
+                        room_type = "channel"
+                    else:
+                        room_type = "group"
+
+                    return {
+                        "name": name,
+                        "type": room_type,
+                        "chat_id": chat_id,
+                        "token": room_id,
+                    }
+
+        except Exception as exc:
+            logger.warning(
+                "Nextcloud Talk: get_chat_info(%s) "
+                "konnte Raumdaten nicht laden: %s",
+                chat_id,
+                exc,
+            )
+
+        return {
+            "name": chat_id,
+            "type": "group",
+            "chat_id": chat_id,
+            "token": chat_id,
+        }
 
 
-def validate_nextcloud_config(config: PlatformConfig) -> bool:
+def validate_nextcloud_config(
+    config: PlatformConfig,
+) -> bool:
     extra = getattr(config, "extra", {}) or {}
-    base_url = extra.get("base_url") or os.getenv("NEXTCLOUD_BASE_URL", "")
-    username = extra.get("username") or os.getenv("NEXTCLOUD_USERNAME", "")
+
+    base_url = (
+        extra.get("base_url")
+        or os.getenv("NEXTCLOUD_BASE_URL", "")
+    )
+
+    username = (
+        extra.get("username")
+        or os.getenv("NEXTCLOUD_USERNAME", "")
+    )
+
     token = (
         extra.get("app_password")
         or getattr(config, "token", "")
         or os.getenv("NEXTCLOUD_APP_PASSWORD", "")
     )
-    return bool(str(base_url).strip() and str(username).strip() and str(token).strip())
+
+    return bool(
+        str(base_url).strip()
+        and str(username).strip()
+        and str(token).strip()
+    )
 
 
-def check_is_connected(adapter_or_config: Any) -> bool:
+def check_is_connected(
+    adapter_or_config: Any,
+) -> bool:
     if hasattr(adapter_or_config, "is_connected"):
         return bool(adapter_or_config.is_connected)
-    return validate_nextcloud_config(adapter_or_config)
+
+    return validate_nextcloud_config(
+        adapter_or_config
+    )
 
 
-def _build_adapter(config: PlatformConfig) -> NextcloudTalkPlatform:
+def _build_adapter(
+    config: PlatformConfig,
+) -> NextcloudTalkPlatform:
     return NextcloudTalkPlatform(config)
 
 
 def register(ctx: Any) -> None:
     """Hermes Platform Plugin Registration Entrypoint."""
+
     ctx.register_platform(
         name="nextcloud",
         label="Nextcloud Talk",
@@ -286,3 +576,4 @@ def register(ctx: Any) -> None:
         max_message_length=16000,
         emoji="☁️",
     )
+```
