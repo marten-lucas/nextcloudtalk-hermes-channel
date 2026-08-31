@@ -9,6 +9,7 @@ statt ungefiltert in den Chat geschrieben zu werden.
 """
 
 from typing import Any, Dict, Tuple
+import re
 
 Category = str
 
@@ -32,7 +33,42 @@ _SUPPRESS_PATTERNS = [
     "working —",
     "subagent working",
     "steer failed",
+    # Upstream hermes-agent Noise-Statuses (_prepare_gateway_status_message):
+    # Retry / Rate-Limit / Fallback
+    "retrying in",
+    "rate limited. waiting",
+    "max retries",
+    "trying fallback",
+    # Compression-Preflight & -Varianten
+    "preflight compression",
+    "pre-api compression",
+    "context reduced to",
+    "skipping concurrent compression",
+    "compression skipped",
+    "compression lock",
+    "title generation failed",
+    "compression summary failed",
+    "compression model",
+    "recovered using main model",
+    # Delivery-Ledger Redelivery-Marker
+    "recovered reply",
+    # Session-Stall-Watchdog
+    "agent session appears stalled",
+    "try /new to reset",
 ]
+
+# Interne Turn-Marker (Memory-Plugin: _INTERNAL_GATEWAY_TURN_RE) und
+# Silence-Narration (upstream filter_silence_narration) — Loop-Vektoren
+# in Bot-zu-Bot-Kanälen.
+_INTERNAL_MARKER_RE = re.compile(
+    r"^\[(async|context|prior|your active task list|important|background)",
+    re.IGNORECASE,
+)
+
+_SILENCE_NARRATION_RE = re.compile(
+    r"^\W*(\(silent\)|🔇|🔇|…|\.{1,3}|silent|no response|no reply)\W*$",
+    re.IGNORECASE,
+)
 
 
 def categorize_gateway_message(text: str) -> Tuple[Category, Dict[str, Any]]:
@@ -52,12 +88,24 @@ def categorize_gateway_message(text: str) -> Tuple[Category, Dict[str, Any]]:
 
     if "gateway restarting" in normalized:
         return ("lifecycle", {"state": "offline", "text": text})
+    if "gateway shutting down" in normalized:
+        return ("lifecycle", {"state": "offline", "text": text})
     if "gateway online" in normalized:
         return ("lifecycle", {"state": "online", "text": text})
     if "draining" in normalized and "active" in normalized and "agent" in normalized:
         return ("lifecycle", {"state": "draining", "text": text})
 
-    if text.strip().startswith("⚠️"):
+    # Silence-Narration & interne Turn-Marker: still verwerfen (Loop-Prävention)
+    if _SILENCE_NARRATION_RE.match(text.strip()):
+        return ("suppress", {})
+    if _INTERNAL_MARKER_RE.match(text.strip()):
+        return ("suppress", {})
+
+    # ⚠️-Präfix: nur als Fehler werten, wenn es kein bekanntes Suppress-Muster ist
+    # (z.B. "⚠️ Max retries … trying fallback", "⚠️ Agent session appears stalled").
+    if text.strip().startswith("⚠️") and not any(
+        pattern in normalized for pattern in _SUPPRESS_PATTERNS
+    ):
         return ("error", {"text": text})
 
     if any(pattern in normalized for pattern in _ERROR_PATTERNS):
