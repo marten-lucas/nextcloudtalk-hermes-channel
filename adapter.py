@@ -981,3 +981,97 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if normalized_content:
             return (normalized_content[:80], "💬")
         return None, None
+
+
+# ---------------------------------------------------------------------------
+# Plugin-Registrierung (Hermes PluginManager)
+# ---------------------------------------------------------------------------
+
+
+def _env(*names: str) -> str:
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return ""
+
+
+def validate_talk_config(config: Any) -> bool:
+    """Prüft eine PlatformConfig auf vollständige Nextcloud-Zugangsdaten."""
+    extra = getattr(config, "extra", {}) or {}
+    base_url = str(extra.get("base_url") or os.getenv("NEXTCLOUD_BASE_URL", "")).strip()
+    username = str(extra.get("username") or os.getenv("NEXTCLOUD_USERNAME", "")).strip()
+    app_password = str(
+        extra.get("app_password")
+        or getattr(config, "token", "")
+        or os.getenv("NEXTCLOUD_APP_PASSWORD", "")
+    ).strip()
+    return bool(base_url and username and app_password)
+
+
+def validate_talk_config_from_env() -> bool:
+    """Env-only Enablement-Check (ohne PlatformConfig)."""
+    return bool(
+        _env("NEXTCLOUD_BASE_URL")
+        and _env("NEXTCLOUD_USERNAME")
+        and _env("NEXTCLOUD_APP_PASSWORD")
+    )
+
+
+def env_enablement() -> Optional[Dict[str, Any]]:
+    """Auto-Populate für `hermes gateway status` bei env-only Setups."""
+    if not validate_talk_config_from_env():
+        return None
+    try:
+        poll = float(_env("NEXTCLOUD_POLL_INTERVAL_SECONDS") or 3.0)
+    except ValueError:
+        poll = 3.0
+    return {
+        "base_url": _env("NEXTCLOUD_BASE_URL"),
+        "username": _env("NEXTCLOUD_USERNAME"),
+        "app_password": _env("NEXTCLOUD_APP_PASSWORD"),
+        "bot_handle": _env("NEXTCLOUD_BOT_HANDLE") or f"@{_env('NEXTCLOUD_USERNAME')}",
+        "require_mention_in_groups": _env(
+            "NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS", "true"
+        ).lower()
+        in {"1", "true", "yes"},
+        "context_message_limit": int(_env("NEXTCLOUD_CONTEXT_MESSAGE_LIMIT") or 20),
+        "poll_interval_seconds": max(1.0, poll),
+        "allowed_rooms": _env("NEXTCLOUD_ALLOWED_ROOMS"),
+        "attachment_tmp_dir": _env("NEXTCLOUD_ATTACHMENT_TMP_DIR"),
+        "hitl_require_requester": _env(
+            "NEXTCLOUD_HITL_REQUIRE_REQUESTER", "true"
+        ).lower()
+        in {"1", "true", "yes"},
+    }
+
+
+def check_is_connected(adapter_or_config: Any) -> bool:
+    if hasattr(adapter_or_config, "is_connected"):
+        return bool(adapter_or_config.is_connected)
+    return validate_talk_config(adapter_or_config)
+
+
+def _build_adapter(config: PlatformConfig) -> NextcloudTalkPlatform:
+    return NextcloudTalkPlatform(config)
+
+
+def register(ctx: Any) -> None:
+    """Registriert die Nextcloud-Talk-Plattform beim Hermes Gateway."""
+    ctx.register_platform(
+        name="nextcloud",
+        label="Nextcloud Talk",
+        adapter_factory=_build_adapter,
+        check_fn=validate_talk_config_from_env,
+        validate_config=validate_talk_config,
+        is_connected=check_is_connected,
+        env_enablement_fn=env_enablement,
+        required_env=[
+            "NEXTCLOUD_BASE_URL",
+            "NEXTCLOUD_USERNAME",
+            "NEXTCLOUD_APP_PASSWORD",
+        ],
+        cron_deliver_env_var="NEXTCLOUD_HOME_CHANNEL",
+        max_message_length=32000,
+        emoji="💬",
+    )

@@ -8,6 +8,7 @@ description: >
   supports mention gating, on-demand context fetch, replyTo messaging, attachment download stubs,
   identity passthrough, active presence/typing signaling, and HITL approvals via reactions.
 author: Local Development
+entrypoint: adapter.py
 requires_env:
   - name: NEXTCLOUD_BASE_URL
     description: "Base URL of Nextcloud instance (e.g. https://cloud.example.org)"
