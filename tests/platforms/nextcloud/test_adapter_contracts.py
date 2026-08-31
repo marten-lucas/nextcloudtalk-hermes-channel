@@ -1,7 +1,25 @@
-yimport asyncio
+import asyncio
+import importlib
+import sys
+import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+
+# Bootstrap: Das Plugin-Verzeichnis als Package laden und `adapter` als
+# Top-Level-Alias bereitstellen, damit `import adapter` funktioniert,
+# obwohl adapter.py relative Imports (from .client import ...) nutzt.
+if "adapter" not in sys.modules:
+    _pkg = types.ModuleType("_ncplugin_under_test")
+    _pkg.__path__ = ["../.."]  # noqa: unused - resolved below
+    import os
+
+    _plugin_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    _pkg.__path__ = [_plugin_root]
+    sys.modules["_ncplugin_under_test"] = _pkg
+    for _mod in ("attachments", "client", "hitl", "identity", "outbound", "presence", "signaling", "adapter"):
+        importlib.import_module(f"_ncplugin_under_test.{_mod}")
+    sys.modules["adapter"] = sys.modules["_ncplugin_under_test.adapter"]
 
 import adapter as nextcloud_adapter_module
 from adapter import NextcloudTalkPlatform

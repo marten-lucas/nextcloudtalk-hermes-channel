@@ -67,3 +67,20 @@ class HITLManager:
             if not pending.future.done():
                 pending.future.set_result(False)
             self._pending_approvals.pop(target_message_id, None)
+
+    def is_fallback_emoji_reply(self, body: str) -> bool:
+        """True, wenn die Nachricht ein nacktes Approval/Reject-Emoji ist."""
+        return body.strip() in self.approve_reactions or body.strip() in self.reject_reactions
+
+    def resolve_fallback_target(self, event: Dict[str, Any]) -> Optional[str]:
+        """Ermittelt die Ziel-Message-ID eines Emoji-Replies aus Chat-Nachricht."""
+        target = str(
+            event.get("referenceId")
+            or event.get("replyTo")
+            or event.get("parentMessageId")
+            or event.get("targetMessageId")
+            or ""
+        ).strip()
+        if target and target in self._pending_approvals:
+            return target
+        return None

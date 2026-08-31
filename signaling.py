@@ -63,3 +63,118 @@ class NextcloudSignalingManager:
                     logger.warning("Nextcloud: Konnte Raum %s nicht inaktiv setzen: %s", room_id, resp.status)
         except Exception as exc:
             logger.warning("Nextcloud: Konnte Raum %s nicht inaktiv setzen: %s", room_id, exc)
+
+    @staticmethod
+    def signaling_ws_url(server: str) -> str:
+        url = server.strip()
+        if url.startswith("https://"):
+            url = "wss://" + url[len("https://"):]
+        elif url.startswith("http://"):
+            url = "ws://" + url[len("http://"):]
+        if url.endswith("/"):
+            url = url[:-1]
+        return f"{url}/spreed"
+
+    async def room_signaling_loop(
+        self,
+        room_id: str,
+        settings: NextcloudSignalingSettings,
+        fetch_room_events: Any,
+        stop_event: Any,
+    ) -> None:
+        """WebSocket-Signaling-Loop für einen Raum: Events triggern Poll-Fetch."""
+        session = await self.client.ensure_session()
+        try:
+            async with session.ws_connect(
+                self.signaling_ws_url(settings.server),
+                heartbeat=30,
+            ) as ws:
+                await self._hello(ws, settings)
+                session_id = self._active_room_sessions.get(room_id)
+                if not session_id:
+                    session_id = await self.mark_room_active(room_id)
+                if not session_id:
+                    raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
+                await self._join_room(ws, room_id, session_id, settings.user_id)
+                async for msg in ws:
+                    if stop_event.is_set():
+                        return
+                    if msg.type != aiohttp.WSMsgType.TEXT:
+                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                            break
+                        continue
+                    payload = json.loads(msg.data)
+                    if payload.get("type") == "event":
+                        event = payload.get("event") or {}
+                        if isinstance(event, dict) and event.get("target") in {"room", "participants"}:
+                            events = await fetch_room_events(room_id)
+                            for event_payload in events:
+                                await self.event_handler(event_payload)
+                    elif payload.get("type") == "room":
+                        events = await fetch_room_events(room_id)
+                        for event_payload in events:
+                            await self.event_handler(event_payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not stop_event.is_set():
+                err_str = str(exc)
+                if "closing transport" in err_str or "closed" in err_str:
+                    logger.debug("Nextcloud websocket transport closed for %s: %s", room_id, exc)
+                else:
+                    logger.warning("Nextcloud websocket room loop ended for %s: %s", room_id, exc)
+
+    async def _hello(self, ws: aiohttp.ClientWebSocketResponse, settings: NextcloudSignalingSettings) -> None:
+        hello_version = "2.0" if settings.hello_auth_params.get("2.0") else "1.0"
+        await ws.send_json(
+            {
+                "type": "hello",
+                "hello": {
+                    "version": hello_version,
+                    "auth": {
+                        "url": self.client.talk_url("apps/spreed/api/v3/signaling/backend"),
+                        "params": settings.hello_auth_params[hello_version],
+                    },
+                },
+            }
+        )
+        while True:
+            msg = await ws.receive()
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                payload = json.loads(msg.data)
+                if payload.get("type") == "welcome":
+                    continue
+                if payload.get("type") == "hello":
+                    return
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"Nextcloud signaling hello failed: {payload}")
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise RuntimeError("Nextcloud signaling websocket closed during hello")
+
+    async def _join_room(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        room_id: str,
+        session_id: str,
+        user_id: str = "",
+    ) -> None:
+        await ws.send_json(
+            {
+                "type": "room",
+                "room": {
+                    "roomid": room_id,
+                    "sessionid": session_id,
+                    **({"userid": user_id} if user_id else {}),
+                },
+            }
+        )
+        while True:
+            msg = await ws.receive()
+            if msg.type == aiohttp.WSMsgType.TEXT:
+                payload = json.loads(msg.data)
+                if payload.get("type") == "room":
+                    return
+                if payload.get("type") == "error":
+                    raise RuntimeError(f"Nextcloud signaling room join failed: {payload}")
+            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                raise RuntimeError("Nextcloud signaling websocket closed during room join")

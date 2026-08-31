@@ -5,31 +5,41 @@ Standalone Hermes platform plugin for **Nextcloud Talk** integration.
 ## Features
 
 - ✅ Connects Hermes as a regular Nextcloud bot user
-- ✅ **WebSocket-first** transport with **HTTP polling fallback**
+- ✅ **WebSocket-first** transport (HPB signaling) with **HTTP polling fallback**
 - ✅ Automatic triggers in 1:1 chats and 2-person rooms
 - ✅ `@mention`-based triggering in group rooms (>2 participants)
-- ✅ On-demand context fetching (last N messages)
-- ✅ **Intelligent message categorization** (lifecycle, error, suppress, forward)
+- ✅ Room allowlist (`NEXTCLOUD_ALLOWED_ROOMS`)
+- ✅ On-demand context fetching (last N messages) for group triggers
+- ✅ **Intelligent outbound message categorization** (lifecycle, error, suppress, forward)
+- ✅ Edit/Delete event handling (edits and deletions re-enter Hermes with context)
+- ✅ `!command` → `/command` alias normalization for gateway commands
 - ✅ Sends replies with Nextcloud `replyTo` metadata for visual context linking
 - ✅ Multimodal support: downloads attachments (images, documents) to temp directory
-- ✅ Sender identity propagation to Hermes and downstream MCP tools
+- ✅ Sender identity propagation to Hermes and downstream MCP tools (`X-On-Behalf-Of`, `X-User-Groups`)
 - ✅ Human-in-the-Loop (HITL) approvals via message reactions
 - ✅ Custom presence and status signaling
 
 ## Repository layout
 
-Standalone Hermes plugin ready for installation:
+Standalone Hermes plugin, modular structure:
 
 ```text
 .
-├── __init__.py
-├── adapter.py              # Core platform adapter with message categorization
-├── plugin.yaml             # Plugin metadata and configuration schema
+├── __init__.py             # Plugin entrypoint (exports NextcloudTalkPlatform, register)
+├── adapter.py              # Core platform adapter: inbound pipeline, outbound routing
+├── client.py               # Nextcloud Talk OCS REST client (+ NextcloudOCSException)
+├── identity.py             # User group lookup with TTL cache + ContextVars identity
+├── hitl.py                 # HITL approval manager (reaction-based)
+├── presence.py             # Presence & custom status manager
+├── attachments.py          # Attachment extraction & download
+├── signaling.py            # WebSocket (HPB) signaling manager
+├── outbound.py             # Outbound message categorization (lifecycle/error/suppress/forward)
+├── plugin.yaml             # Plugin metadata
 ├── docs/
-│   └── nextcloud-talk.md   # Extended documentation
-├── tests/
-│   └── test_adapter_contracts.py
-└── README.md               # This file
+│   ├── nextcloud-talk.md   # Extended documentation
+│   └── restoration-plan.md # Refactor parity plan (historical)
+└── tests/
+    └── platforms/nextcloud/test_adapter_contracts.py
 ```
 
 Installation: Copy to `~/.hermes/plugins/nextcloud-talk/` or install via Hermes Dashboard UI.
@@ -83,9 +93,28 @@ hermes reload plugins
 
 ## Message Handling
 
-The plugin intelligently categorizes messages for appropriate handling:
+### Inbound (Nextcloud → Hermes)
 
-### Category A: **Lifecycle** (Status + Presence)
+The adapter processes incoming events through a filter and trigger pipeline:
+
+1. **Reaction events** are routed to the HITL manager (✅/👍 approve, ❌/👎 reject, ⛔ cancel)
+2. **Non-user actors** (`actorType != "users"`) are ignored
+3. **Native system messages** (`systemMessage` flag) are ignored (except deletions)
+4. **Own messages** (bot username) and reserved accounts (`system`, `changelog`, `sample`) are ignored
+5. **Known system text patterns** (e.g. „Das System hat …", „{actor}") are ignored
+6. **Room allowlist** (`NEXTCLOUD_ALLOWED_ROOMS`) is enforced
+7. **Trigger gating**: 1:1 / 2-participant rooms always trigger; group rooms require `@mention` (configurable)
+8. **Edit/Delete events** re-enter Hermes with contextual text („Nachricht wurde geändert zu …" / „… wurde geloescht.")
+9. **Attachments** are extracted and downloaded; empty messages without attachments are ignored
+10. **Group context**: last N messages are fetched and attached as `context_messages`
+11. **Command normalization**: `!command` aliases are resolved to `/command` gateway commands
+12. **Identity**: sender groups are resolved (TTL-cached) and injected as `X-On-Behalf-Of` / `X-User-Groups` headers plus ContextVars for downstream MCP tools
+
+### Outbound (Hermes → Nextcloud)
+
+Every outgoing message is categorized before sending:
+
+#### Category A: **Lifecycle** (Status + Presence)
 
 Gateway operational events trigger presence and custom status updates:
 
@@ -95,19 +124,19 @@ Gateway operational events trigger presence and custom status updates:
 
 **Behavior:** Status and presence are updated in Nextcloud; no message sent to chat.
 
-### Category B: **Error** (Reply with Context)
+#### Category B: **Error** (Reply with Context)
 
 Error messages are formatted and sent as replies to the triggering message:
 
 - Messages starting with `⚠️`
 - Patterns: `"processing stopped"`, `"no response"`, `"session too large"`, `"authentication failed"`, `"provider failed"`, `"tool failed"`, etc.
 
-**Behavior:** 
+**Behavior:**
 - Sent as reply to trigger message (visually linked via `replyTo`)
 - Format: `🚫 **Fehler**\n\n{original_error_message}`
 - If no trigger message exists: shown in custom status only (fallback)
 
-### Category C: **Suppress** (Silent Handling)
+#### Category C: **Suppress** (Silent Handling)
 
 Queue and progress messages that clutter the chat are silently suppressed:
 
@@ -115,14 +144,11 @@ Queue and progress messages that clutter the chat are silently suppressed:
 
 **Behavior:** Message never reaches Nextcloud; `SendResult(success=True)` returned silently.
 
-### Category D: **Forward** (Send As-Is)
+#### Category D: **Forward** (Send As-Is)
 
 All other messages sent as normal bot responses:
 
-- Generic responses, answers, acknowledgments
-- Unknown or uncategorized messages (safe fallback)
-
-**Behavior:** Sent to chat as-is with optional `replyTo` if available.
+**Behavior:** Sent to chat as-is with optional `replyTo` if available; room is marked active.
 
 ---
 
@@ -146,8 +172,8 @@ All other messages sent as normal bot responses:
 | `NEXTCLOUD_POLL_INTERVAL_SECONDS` | `3` | Polling interval when WebSocket unavailable |
 | `NEXTCLOUD_ALLOWED_USERS` | (none) | Comma-separated allowed user IDs (allowlist) |
 | `NEXTCLOUD_ALLOW_ALL_USERS` | `false` | Allow all users (dev/testing only) |
-| `NEXTCLOUD_ALLOWED_ROOMS` | (none) | Comma-separated allowed room IDs (allowlist) |
-| `NEXTCLOUD_ATTACHMENT_TMP_DIR` | `/tmp/nc_hermes` | Directory for temporary attachment downloads |
+| `NEXTCLOUD_ALLOWED_ROOMS` | (none) | Comma-separated allowed room tokens (allowlist) |
+| `NEXTCLOUD_ATTACHMENT_TMP_DIR` | (system temp) | Directory for temporary attachment downloads |
 | `NEXTCLOUD_HITL_REQUIRE_REQUESTER` | `true` | Only original requester can approve/reject reactions |
 | `NEXTCLOUD_HOME_CHANNEL` | (none) | Default room ID for cron/scheduled delivery |
 | `NEXTCLOUD_HOME_CHANNEL_NAME` | (none) | Display name for home channel |
@@ -156,7 +182,7 @@ All other messages sent as normal bot responses:
 
 - **1:1 chats**: Every message triggers Hermes (no mention required)
 - **2-participant rooms**: Every message triggers Hermes (no mention required)
-- **Group rooms (>2 participants)**: Only messages with bot mention trigger Hermes
+- **Group rooms (>2 participants)**: Only messages with bot mention trigger Hermes (disable via `NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS=false`)
 
 ### HITL Approvals
 
@@ -164,6 +190,7 @@ Tool execution confirmations use message reactions:
 
 - **Approve**: `✅`, `👍`
 - **Reject**: `❌`, `👎`
+- **Cancel**: `⛔` (stops the running session)
 
 Only the original message sender can approve/reject (when `NEXTCLOUD_HITL_REQUIRE_REQUESTER=true`).
 
@@ -174,8 +201,7 @@ Only the original message sender can approve/reject (when `NEXTCLOUD_HITL_REQUIR
 ### Run unit tests
 
 ```bash
-python -m unittest -q tests.platforms.nextcloud.test_adapter_contracts
-python -m unittest discover -q
+python -m unittest discover -s tests -q
 ```
 
 ### Manual smoke testing
@@ -183,7 +209,8 @@ python -m unittest discover -q
 1. Invite the bot user to a 1:1 or group room
 2. Send a message (1:1) or mention the bot (group room)
 3. Verify bot responds in the same room with `replyTo` context
-4. Check Hermes logs: look for `category='forward'|'error'|'suppress'|'lifecycle'` categorization entries
+4. Verify gateway notices (restart/queued/compression) do **not** appear in the chat
+5. React with ✅/❌ on a HITL prompt and verify approval flow
 
 ---
 
@@ -202,16 +229,16 @@ python -m unittest discover -q
 
 The plugin is structurally similar to the [Matrix platform plugin](https://github.com/NousResearch/hermes-agent/tree/main/plugins/platforms/matrix) but tailored for Nextcloud Talk:
 
-- **Transport abstraction**: WebSocket vs. polling handled transparently
+- **Transport abstraction**: WebSocket (HPB signaling) vs. polling handled transparently, with polling as safety-net alongside WebSocket
 - **Identity mapping**: Sender user ID passed to Hermes for context-aware tool execution
 - **MCP integration**: User context flows to downstream Nextcloud MCP Server for access-controlled tool execution
-- **Updatefat design**: No dependencies on Hermes core i18n keys; all messages handled generically
+- **Outbound filtering**: All gateway-internal noise is categorized and kept out of the chat (loop prevention)
 
 For extended documentation, see [docs/nextcloud-talk.md](docs/nextcloud-talk.md).
 
 ## Version
 
-- **Plugin version**: 0.1.23
+- **Plugin version**: 0.2.1
 - **Hermes compatibility**: v0.3.0+
 - **Status**: Production-ready for Nextcloud 25+
 
@@ -239,5 +266,9 @@ Look for `fallback to polling` or `Connecting via HTTP polling` messages. This i
 
 1. Verify bot is in the room
 2. Use exact handle: `@hermes` (check `NEXTCLOUD_BOT_HANDLE` env var)
-3. Check Hermes logs for "No matching message pattern" or categorization entries
-4. Ensure sender user ID is not in `NEXTCLOUD_ALLOWED_USERS` blocklist
+3. Check Hermes logs for trigger gating entries
+4. Ensure the room token is in `NEXTCLOUD_ALLOWED_ROOMS` if an allowlist is configured
+
+### Bot spams the chat with internal messages
+
+This indicates outbound categorization is not active. Verify `outbound.py` is present and `send_message` routes through `categorize_gateway_message()`. Gateway notices (restart, queued, compression) must never appear as chat messages.
