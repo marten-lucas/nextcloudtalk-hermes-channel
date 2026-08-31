@@ -236,12 +236,6 @@ The plugin is structurally similar to the [Matrix platform plugin](https://githu
 
 For extended documentation, see [docs/nextcloud-talk.md](docs/nextcloud-talk.md).
 
-## Version
-
-- **Plugin version**: 0.2.1
-- **Hermes compatibility**: v0.3.0+
-- **Status**: Production-ready for Nextcloud 25+
-
 ## Troubleshooting
 
 ### Plugin shows "inactive"
