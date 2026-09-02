@@ -11,10 +11,10 @@ from unittest.mock import AsyncMock
 # obwohl adapter.py relative Imports (from .client import ...) nutzt.
 if "adapter" not in sys.modules:
     _pkg = types.ModuleType("_ncplugin_under_test")
-    _pkg.__path__ = ["../.."]  # noqa: unused - resolved below
     import os
 
-    _plugin_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    # tests/platforms/nextcloud/ -> 3 Ebenen hoch = Plugin-Root
+    _plugin_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     _pkg.__path__ = [_plugin_root]
     sys.modules["_ncplugin_under_test"] = _pkg
     for _mod in ("attachments", "client", "hitl", "identity", "outbound", "presence", "signaling", "adapter"):
@@ -23,6 +23,71 @@ if "adapter" not in sys.modules:
 
 import adapter as nextcloud_adapter_module
 from adapter import NextcloudTalkPlatform
+
+
+class _MockTalkClient:
+    """Mock-Client, der die OCS-Aufrufe des Adapters und aller Manager abfängt.
+
+    Ersetzt die früheren Adapter-Hooks _ocs_get/_ocs_post, die beim
+    Manager-Refactor (v0.2.0) entfernt wurden.
+    """
+
+    def __init__(self, adapter):
+        self.adapter = adapter
+
+    def _record(self, method, path, *args):
+        self.adapter.calls.append((method, path, *args))
+
+    async def ocs_get(self, path, params=None):
+        self._record("ocs_get", path, params)
+        if path == "apps/spreed/api/v3/signaling/settings":
+            return {
+                "server": "",
+                "helloAuthParams": {},
+                "signalingMode": "standalone",
+                "userId": "hermes",
+            }
+        if path == "apps/spreed/api/v4/room":
+            return [{"token": rid} for rid in self.adapter.mock_joined_rooms]
+        if path.endswith("/participants"):
+            parts = path.split("/")
+            room_id = parts[5] if len(parts) > 5 else ""
+            count = self.adapter.mock_participants.get(room_id, 3)
+            return [{"id": f"user-{i}"} for i in range(count)]
+        if path.startswith("apps/spreed/api/v4/room/") and path.count("/") == 5:
+            # Einzelraum-Metadaten (Existenz-/readOnly-Prüfung)
+            parts = path.split("/")
+            room_id = parts[5]
+            if room_id in self.adapter.mock_room_meta:
+                return self.adapter.mock_room_meta[room_id]
+            return {"token": room_id, "readOnly": 0, "participantType": 3}
+        if "/chat/" in path:
+            return list(self.adapter.mock_room_messages)
+        return []
+
+    async def ocs_post(self, path, data=None):
+        self._record("ocs_post", path, data)
+        if path.endswith("/participants/active"):
+            return {"sessionId": "session-1"}
+        return {"id": "sent-1"}
+
+    async def ocs_put(self, path, data=None):
+        self._record("ocs_put", path, data)
+        return {}
+
+    async def ocs_delete(self, path):
+        self._record("ocs_delete", path)
+        return {}
+
+    async def cloud_ocs_get(self, path, params=None):
+        self._record("cloud_ocs_get", path, params)
+        return {"groups": []}
+
+    async def ensure_session(self):
+        return None
+
+    async def close(self):
+        return None
 
 
 class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
@@ -38,6 +103,17 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.custom_status_updates = []
         self.custom_status_clears = []
         self.cancelled_sessions = []
+        self.mock_room_meta = {}
+        # Client durch Mock ersetzen (Adapter ruft seit v0.2.0
+        # self.client.ocs_get/ocs_post direkt auf statt Adapter-Hooks)
+        self.client = _MockTalkClient(self)
+        # Manager neu verdrahten, damit sie den Mock-Client nutzen
+        self.identity_mgr.client = self.client
+        self.presence_mgr.client = self.client
+        self.signaling_mgr.client = self.client
+        self.attachment_mgr.client = self.client
+        self.hitl_mgr.client = self.client
+        self._hooked_presence()
 
     async def _connect_websocket_once(self) -> bool:
         self.calls.append(("connect_websocket",))
@@ -48,30 +124,10 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self._polling_task = asyncio.create_task(asyncio.sleep(0.001))
 
     async def _ocs_get(self, path, params=None):
-        self.calls.append(("ocs_get", path, params))
-        if path == "apps/spreed/api/v3/signaling/settings":
-            return {
-                "server": "",
-                "helloAuthParams": {},
-                "signalingMode": "standalone",
-                "userId": "hermes",
-            }
-        if path == "apps/spreed/api/v4/room":
-            return [{"token": rid} for rid in self.mock_joined_rooms]
-        if path.endswith("/participants"):
-            parts = path.split("/")
-            room_id = parts[5] if len(parts) > 5 else ""
-            count = self.mock_participants.get(room_id, 3)
-            return [{"id": f"user-{i}"} for i in range(count)]
-        if "/chat/" in path:
-            return list(self.mock_room_messages)
-        return []
+        return await self.client.ocs_get(path, params)
 
     async def _ocs_post(self, path, data):
-        self.calls.append(("ocs_post", path, data))
-        if path.endswith("/participants/active"):
-            return {"sessionId": "session-1"}
-        return {"id": "sent-1"}
+        return await self.client.ocs_post(path, data)
 
     async def _download_attachment_from_metadata(self, attachment):
         self.calls.append(("download_attachment", attachment))
@@ -85,6 +141,22 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
 
     async def _clear_custom_status_message(self, force=False):
         self.custom_status_clears.append(force)
+
+    def _hooked_presence(self):
+        """Presence-Manager mit Hook-Delegation ersetzen (v0.1.22-Verhalten)."""
+        adapter = self
+
+        class _HookedPresenceManager(type(self.presence_mgr)):
+            async def set_presence_status(state_self, state):
+                await adapter._set_presence_status(state)
+
+            async def set_custom_status_message(state_self, message, status_icon=None):
+                await adapter._set_custom_status_message(message, status_icon)
+
+            async def clear_custom_status_message(state_self, *, force=False):
+                await adapter._clear_custom_status_message(force=force)
+
+        self.presence_mgr = _HookedPresenceManager(self.client)
 
     async def cancel_session_processing(self, session_key, **kwargs):
         self.cancelled_sessions.append((session_key, kwargs))
@@ -119,7 +191,9 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
         )
         adapter.mock_participants["room-identity"] = 2
-        adapter._get_user_groups = AsyncMock(return_value=["admin", "kiga_board"])
+        adapter.identity_mgr.get_user_groups = AsyncMock(
+            return_value=["admin", "kiga_board"]
+        )
 
         await adapter.handle_incoming_event(
             {"room_id": "room-identity", "id": "m-id", "actorId": "vorstand", "message": "Bitte helfen"}
@@ -403,7 +477,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
                 return [{"id": "1", "message": "old1"}, {"id": "2", "message": "old2"}]
             return [{"id": "3", "message": "new"}]
 
-        adapter._ocs_get = fake_ocs_get  # type: ignore[assignment]
+        adapter.client.ocs_get = fake_ocs_get  # type: ignore[method-assign]
 
         first = await adapter._fetch_room_events(room_id)
         second = await adapter._fetch_room_events(room_id)
@@ -428,7 +502,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
                 return [{"id": "12", "message": "newest"}, {"id": "10", "message": "older"}]
             return [{"id": "14", "message": "newer"}, {"id": "13", "message": "old"}]
 
-        adapter._ocs_get = fake_ocs_get  # type: ignore[assignment]
+        adapter.client.ocs_get = fake_ocs_get  # type: ignore[method-assign]
         first = await adapter._fetch_room_events(room_id)
         self.assertEqual(first, [])
         self.assertEqual(adapter._poll_cursor_by_room[room_id], "12")

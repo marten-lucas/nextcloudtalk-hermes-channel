@@ -205,6 +205,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._session_reset_noted_rooms: set[str] = set()
         self._sent_message_ids: List[str] = []
         self._room_ws_tasks: Dict[str, asyncio.Task[None]] = {}
+        # Cache für Raum-Metadaten (readOnly-Flag), TTL-gesteuert
+        self._room_meta_cache: Dict[str, Dict[str, Any]] = {}
+        self._room_meta_cache_ts: Dict[str, float] = {}
+        self._room_meta_ttl_seconds: float = 300.0
 
 
     @property
@@ -401,9 +405,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
                 events.append(normalized)
 
-                self._poll_cursor_by_room[room_id] = str(
-                    event.get("id", "")
-                )
+            # Cursor auf die HÖCHSTE Message-ID setzen (Talk liefert
+            # absteigende Reihenfolge; die letzte in der Liste ist die
+            # älteste — siehe Fix f9f057b).
+            latest_id = self._latest_message_id(data)
+            if latest_id:
+                self._poll_cursor_by_room[room_id] = latest_id
 
         return events
 
@@ -608,6 +615,83 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
 
         await self.handle_message(msg_event)
+
+    async def _get_room_meta(self, room_id: str) -> Optional[Dict[str, Any]]:
+        """Raum-Metadaten (Existenz + readOnly) mit TTL-Cache abrufen.
+
+        Liefert ein leeres Dict, wenn der Raum nicht existiert (HTTP 404) —
+        in dem Fall darf nicht gesendet werden. Liefert None bei anderen
+        Fehlern (Prüfung nicht möglich, fail-open).
+        """
+        import time as _time
+
+        now = _time.monotonic()
+        cached_ts = self._room_meta_cache_ts.get(room_id)
+        if cached_ts is not None and (now - cached_ts) < self._room_meta_ttl_seconds:
+            return self._room_meta_cache.get(room_id)
+
+        try:
+            meta = await self.client.ocs_get(f"apps/spreed/api/v4/room/{room_id}")
+        except NextcloudOCSException as exc:
+            if exc.status_code == 404:
+                logger.warning(
+                    "[Nextcloud Talk] Raum '%s' existiert nicht (mehr) — Senden übersprungen.",
+                    room_id,
+                )
+                self._room_meta_cache[room_id] = {}
+                self._room_meta_cache_ts[room_id] = now
+                return {}
+            logger.warning(
+                "[Nextcloud Talk] Raum-Metadaten für '%s' nicht abrufbar (HTTP %s): %s",
+                room_id,
+                exc.status_code,
+                exc.message,
+            )
+            return None
+        except Exception as exc:
+            logger.warning(
+                "[Nextcloud Talk] Raum-Metadaten für '%s' nicht abrufbar: %s",
+                room_id,
+                exc,
+            )
+            return None
+
+        if not isinstance(meta, dict) or not meta:
+            return None
+
+        self._room_meta_cache[room_id] = meta
+        self._room_meta_cache_ts[room_id] = now
+        return meta
+
+    async def _can_send_to_room(self, room_id: str) -> tuple[bool, Optional[str]]:
+        """Prüft Existenz und Sendeberechtigung eines Raums, bevor gepostet wird.
+
+        Returns:
+            (ok, reason): ok=False mit reason, wenn das Senden abgebrochen
+            werden soll. Bei unklarer Prüfung (API-Fehler) wird ok=True
+            zurückgegeben, damit der POST es weiterhin versuchen darf.
+        """
+        meta = await self._get_room_meta(room_id)
+        if meta is None:
+            # Prüfung nicht möglich — POST darf es versuchen (fail-open)
+            return True, None
+        if not meta:
+            # 404: Raum existiert nicht (mehr)
+            return False, f"Room '{room_id}' does not exist (404)"
+
+        # readOnly: 0 = beschreibbar, 1 = nur Moderatoren, 2 = nur Admins.
+        # participantType: 1 = Owner, 2 = Moderator, 3 = User, 4 = Guest.
+        read_only = int(meta.get("readOnly") or 0)
+        participant_type = int(meta.get("participantType") or 0)
+        is_moderator = participant_type in (1, 2)
+
+        if read_only and not is_moderator:
+            return False, (
+                f"Room '{room_id}' is read-only (readOnly={read_only}) "
+                f"and bot is not a moderator (participantType={participant_type})"
+            )
+
+        return True, None
 
     def _should_trigger(self, body: str, participant_count: int) -> bool:
         """Mention-Gating: DMs (<=2) immer, Gruppen nur bei Mention (konfigurierbar)."""
@@ -899,6 +983,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         if metadata:
             payload.update(metadata)
+
+        # Existenz- und Rechte-Prüfung vor dem POST (verhindert 403/404-Noise)
+        can_send, deny_reason = await self._can_send_to_room(room_id)
+        if not can_send:
+            logger.warning(
+                "[Nextcloud Talk] Senden an Raum '%s' abgelehnt: %s",
+                room_id,
+                deny_reason,
+            )
+            return SendResult(success=False, error=deny_reason)
 
         try:
             await self.signaling_mgr.mark_room_active(room_id)
