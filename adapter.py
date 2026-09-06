@@ -1184,9 +1184,21 @@ def env_enablement() -> Optional[Dict[str, Any]]:
 
 
 def check_is_connected(adapter_or_config: Any) -> bool:
+    """Verbindungsanzeige für Dashboard/Status.
+
+    Wird vom Gateway mit einem PlatformConfig (noch nicht verbunden) ODER mit
+    der aktiven Adapter-Instanz aufgerufen. Stehen die Credentials (wie in
+    diesem Deployment) nur in der .env und nicht in der PlatformConfig, fällt
+    die Prüfung auf die Env-Validierung zurück — sonst filtert das Dashboard
+    die Plattform fälschlich aus der Status-Anzeige heraus.
+    """
     if hasattr(adapter_or_config, "is_connected"):
         return bool(adapter_or_config.is_connected)
-    return validate_talk_config(adapter_or_config)
+    if validate_talk_config(adapter_or_config):
+        return True
+    # Credentials kommen aus der .env (env_enablement-Pfad) — PlatformConfig
+    # trägt sie nicht. Gleiche Prüfung wie beim Gateway-Start.
+    return validate_talk_config_from_env()
 
 
 def _build_adapter(config: PlatformConfig) -> NextcloudTalkPlatform:
