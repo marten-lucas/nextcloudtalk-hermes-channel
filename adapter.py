@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -211,10 +212,40 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._room_meta_cache_ts: Dict[str, float] = {}
         self._room_meta_ttl_seconds: float = 300.0
 
+        # ── Empfangs-Überwachung (Resilience) ──
+        # Letzter empfangener Event/Poll pro Raum (time.monotonic).
+        self._last_rx: Dict[str, float] = {}
+        # Watchdog-Task: prükt periodisch, ob Empfangspfade gestorben
+        # oder gestalled sind, und startet sie neu.
+        self._watchdog_task: Optional[asyncio.Task[None]] = None
+        # Periodisches Low-Frequency-Polling läuft IMMER als Sicherheitsschicht
+        # unter dem WebSocket-Pfad (Dedupe über _poll_cursor/_message_index).
+        self._lfp_enabled: bool = str(
+            os.getenv("NEXTCLOUD_LOWFREQ_POLLING", "true")
+        ).lower() in {"1", "true", "yes"}
+        self._lfp_interval_seconds: float = 60.0
+        # Ein WS-Empfang gilt nach so vielen Sekunden ohne Event als stalled.
+        self._rx_stall_seconds: float = float(
+            os.getenv("NEXTCLOUD_RX_STALL_SECONDS", "180")
+        )
+
 
     @property
     def is_connected(self) -> bool:
-        return not self._stop_event.is_set()
+        """True nur, wenn mindestens ein Empfangspfad lebendig ist.
+
+        Ein gestarteter, aber längst abgestorbener WS-Task oder ein toter
+        Polling-Task darf nicht als „verbunden" gemeldet werden — sonst
+        verhindert der Status Reconnects und täuscht Dashboard/Gateway.
+        """
+        if self._stop_event.is_set():
+            return False
+        if self._polling_task and not self._polling_task.done():
+            return True
+        return any(
+            task and not task.done()
+            for task in self._room_ws_tasks.values()
+        )
 
     async def connect(
         self,
@@ -232,6 +263,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             self._start_polling_loop()
         else:
             logger.info("Nextcloud Talk: WebSocket-Signaling gestartet.")
+
+        # Dauerhaftes Low-Frequency-Polling als Sicherheitsschicht unter
+        # dem WS-Pfad (Dedupe verhindert Doppelzustellung). Fängt Nachrichten
+        # auf, die ein still gestorbenes WS-Signaling verpasst.
+        if self._lfp_enabled:
+            self._start_polling_loop()
+
+        # Watchdog: überwacht WS-Tasks und Empfangsaktivität.
+        self._start_watchdog()
 
         await self.presence_mgr.set_presence_status(
             "online"
@@ -252,7 +292,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         tasks = [
             task
-            for task in (self._polling_task, *self._room_ws_tasks.values())
+            for task in (
+                self._polling_task,
+                self._watchdog_task,
+                *self._room_ws_tasks.values(),
+            )
             if task
         ]
         for task in tasks:
@@ -260,6 +304,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._polling_task = None
+        self._watchdog_task = None
         self._room_ws_tasks = {}
 
         await self.presence_mgr.set_presence_status(
@@ -293,17 +338,131 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if not settings:
                 continue
             task = asyncio.create_task(
-                self.signaling_mgr.room_signaling_loop(
+                self._supervised_room_loop(
                     room_id,
                     settings,
-                    self._fetch_room_events,
-                    self._stop_event,
                 )
             )
             self._room_ws_tasks[room_id] = task
             started_any = True
 
         return started_any
+
+    async def _supervised_room_loop(
+        self,
+        room_id: str,
+        settings: Any,
+    ) -> None:
+        """Supervidiert den WS-Signaling-Loop eines Raums mit Auto-Reconnect.
+
+        Der innere Loop endet bei WS-Close/Timeout still — ohne Supervisor
+        würde der Empfangspfad verlöschen, während der Adapter weiter
+        „verbunden" meldet. Hier wird der Loop alle ``_rx_stall_seconds``-
+        unabhängigen 5 s nach Ende neu gestartet, bis der Adapter stoppt.
+        """
+        backoff = 5.0
+        while not self._stop_event.is_set():
+            try:
+                await self.signaling_mgr.room_signaling_loop(
+                    room_id,
+                    settings,
+                    self._fetch_room_events,
+                    self._stop_event,
+                )
+                if self._stop_event.is_set():
+                    return
+                logger.warning(
+                    "Nextcloud Talk: WS für Raum %s endete — Reconnect in %.0fs",
+                    room_id,
+                    backoff,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if self._stop_event.is_set():
+                    return
+                logger.warning(
+                    "Nextcloud Talk: WS für Raum %s crashte: %s — Reconnect in %.0fs",
+                    room_id,
+                    exc,
+                    backoff,
+                )
+            await asyncio.sleep(backoff)
+
+    def _start_watchdog(self) -> None:
+        if self._watchdog_task and not self._watchdog_task.done():
+            return
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+    async def _watchdog_loop(self) -> None:
+        """Erkennt tote/gestallte Empfangspfade und startet sie neu.
+
+        Kriterien pro Raum:
+        - WS-Task done → sofort neu starten
+        - Kein RX seit ``_rx_stall_seconds`` (WS lebt, HPB liefert nichts) →
+          Task killen und neu starten (Supervisor übernimmt den Reconnect).
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(60.0)
+                if self._stop_event.is_set():
+                    return
+
+                now = time.monotonic()
+                for room_id, task in list(self._room_ws_tasks.items()):
+                    if self._stop_event.is_set():
+                        return
+
+                    if task.done():
+                        logger.warning(
+                            "Nextcloud Talk: Watchdog — WS-Task für Raum %s ist done; starte neu.",
+                            room_id,
+                        )
+                        await self._restart_room_ws(room_id)
+                        continue
+
+                    last_rx = self._last_rx.get(room_id)
+                    if (
+                        last_rx is not None
+                        and (now - last_rx) > self._rx_stall_seconds
+                    ):
+                        logger.warning(
+                            "Nextcloud Talk: Watchdog — kein Empfang in Raum %s seit %.0fs; starte WS neu.",
+                            room_id,
+                            now - last_rx,
+                        )
+                        await self._restart_room_ws(room_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Nextcloud Talk: Watchdog-Fehler: %s", exc)
+
+    async def _restart_room_ws(self, room_id: str) -> None:
+        old = self._room_ws_tasks.get(room_id)
+        if old and not old.done():
+            old.cancel()
+            try:
+                await old
+            except (asyncio.CancelledError, Exception):
+                pass
+        settings = None
+        try:
+            settings = await self.signaling_mgr.get_signaling_settings(room_id)
+        except Exception as exc:
+            logger.warning(
+                "Nextcloud Talk: Signaling-Settings für Raum %s nicht abrufbar: %s",
+                room_id,
+                exc,
+            )
+        if not settings:
+            # Raum ggf. nicht mehr vorhanden — Task-Eintrag entfernen.
+            self._room_ws_tasks.pop(room_id, None)
+            self._last_rx.pop(room_id, None)
+            return
+        self._room_ws_tasks[room_id] = asyncio.create_task(
+            self._supervised_room_loop(room_id, settings)
+        )
+        self._last_rx[room_id] = time.monotonic()
 
     async def _list_joined_rooms(self) -> List[str]:
         data = await self.client.ocs_get(
@@ -338,6 +497,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
                         if self.runtime.allowed_rooms and room_id not in self.runtime.allowed_rooms:
                             continue
+
+                        # RX-Zeitstempel auch für Polls pflegen — der Watchdog
+                        # behandelt Polling als gültigen Empfangspfad.
+                        self._last_rx[room_id] = time.monotonic()
 
                         events = await self._fetch_room_events(
                             room_id
@@ -434,6 +597,35 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self,
         event: Dict[str, Any],
     ) -> None:
+        # RX-Zeitstempel für den Watchdog (Stall-Erkennung).
+        room_id = str(event.get("room_id") or "")
+        if room_id:
+            self._last_rx[room_id] = time.monotonic()
+
+        # Dedupe: WS-Pfad und Low-Frequency-Polling können dieselbe Nachricht
+        # liefern (Cursor setzen unterschiedlich). Verarbeitung nur einmalig
+        # pro Message-ID — erste Zustellung gewinnt.
+        dedupe_id = str(
+            event.get("id")
+            or event.get("message_id")
+            or event.get("messageId")
+            or ""
+        )
+        if dedupe_id:
+            if not hasattr(self, "_dispatched_ids"):
+                self._dispatched_ids: Dict[str, float] = {}
+            now_mono = time.monotonic()
+            first_seen = self._dispatched_ids.get(dedupe_id)
+            if first_seen is not None:
+                return
+            self._dispatched_ids[dedupe_id] = now_mono
+            # Ring-Limit: alte IDs entfernen (Speicher begrenzen)
+            if len(self._dispatched_ids) > 5000:
+                cutoff = now_mono - 3600.0
+                self._dispatched_ids = {
+                    k: v for k, v in self._dispatched_ids.items() if v > cutoff
+                }
+
         event_type = str(event.get("eventType", event.get("type", "message"))).lower()
 
         # Reaction-Events an HITL-Manager dispatchen
