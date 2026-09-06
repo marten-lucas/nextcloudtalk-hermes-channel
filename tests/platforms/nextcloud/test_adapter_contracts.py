@@ -22,7 +22,7 @@ if "adapter" not in sys.modules:
     sys.modules["adapter"] = sys.modules["_ncplugin_under_test.adapter"]
 
 import adapter as nextcloud_adapter_module
-from adapter import NextcloudTalkPlatform
+from adapter import NextcloudTalkPlatform, MessageType
 
 
 class _MockTalkClient:
@@ -169,6 +169,14 @@ def make_config(**extra):
     return SimpleNamespace(extra=extra, token=None)
 
 
+def source_get(source, key, default=None):
+    """Liest ein Feld aus einer Source — dict (Test-Fallback-Base) oder
+    reales SessionSource-Objekt (Hermes >= 0.20 Gateway)."""
+    if isinstance(source, dict):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
 class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_group_room_requires_mention_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -184,7 +192,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             {"room_id": "room1", "id": "m2", "actorId": "kassier", "message": "@hermes bitte helfen"}
         )
         self.assertEqual(len(adapter.received_events), 1)
-        self.assertEqual(adapter.received_events[0].source["user_id"], "kassier")
+        self.assertEqual(source_get(adapter.received_events[0].source, "user_id"), "kassier")
 
     async def test_identity_headers_use_human_source_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -200,9 +208,15 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(adapter.received_events), 1)
-        self.assertEqual("vorstand", adapter.received_events[0].source["user_id"])
-        self.assertEqual("vorstand", adapter.received_events[0].source["extra_headers"]["X-On-Behalf-Of"])
-        self.assertEqual("admin,kiga_board", adapter.received_events[0].source["extra_headers"]["X-User-Groups"])
+        source = adapter.received_events[0].source
+        self.assertEqual("vorstand", source_get(source, "user_id"))
+        self.assertEqual(
+            "vorstand", source_get(source, "extra_headers", {})["X-On-Behalf-Of"]
+        )
+        self.assertEqual(
+            "admin,kiga_board",
+            source_get(source, "extra_headers", {})["X-User-Groups"],
+        )
 
     async def test_two_participant_room_always_triggers_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -214,7 +228,7 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             {"room_id": "room2", "id": "m1", "actorId": "vorstand", "message": "Ohne Mention"}
         )
         self.assertEqual(len(adapter.received_events), 1)
-        self.assertEqual(adapter.received_events[0].source["chat_type"], "dm")
+        self.assertEqual(source_get(adapter.received_events[0].source, "chat_type"), "dm")
 
     async def test_group_room_uses_api_participant_count_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -277,7 +291,8 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             {"room_id": "room-bang", "id": "m-bang", "actorId": "vorstand", "message": "!stop bitte"}
         )
         self.assertEqual(adapter.received_events[0].text, "/stop bitte")
-        self.assertEqual(adapter.received_events[0].message_type, "command")
+        # Real-Env: MessageType-Enum; Test-Fallback-Env: str "command"
+        self.assertIn(adapter.received_events[0].message_type, ("command", MessageType.COMMAND))
 
     async def test_gateway_restarting_notice_updates_presence_contract(self):
         adapter = TestableNextcloudTalkPlatform(
@@ -316,8 +331,8 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         source = adapter.received_events[0].source
-        self.assertEqual(source["user_id"], "vorstand")
-        self.assertEqual(source["user_name"], "vorstand")
+        self.assertEqual(source_get(source, "user_id"), "vorstand")
+        self.assertEqual(source_get(source, "user_name"), "vorstand")
 
     async def test_fresh_session_existing_chat_adds_reset_note_contract(self):
         adapter = TestableNextcloudTalkPlatform(

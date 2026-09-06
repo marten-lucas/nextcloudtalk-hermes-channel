@@ -98,8 +98,30 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     supports_status_text = True
 
+    @staticmethod
+    def _resolve_platform():
+        """Platform-Member robust auflösen (auch ohne Plugin-Discovery).
+
+        ``Platform("nextcloud")`` erzeugt nur dann dynamisch ein Pseudo-
+        Member, wenn das Plugin gebündelt ist oder die Registry den Namen
+        kennt. In Test- oderisolierteren Kontexten ist beides nicht der
+        Fall — dann fällt die Auflösung auf "matrix" (immer vorhanden)
+        zurück; das Tag dient nur der Adapter-Kennzeichnung.
+        """
+        try:
+            return Platform("nextcloud")
+        except ValueError:
+            try:
+                from gateway.platform_registry import platform_registry
+
+                if platform_registry.is_registered("nextcloud"):
+                    return Platform("nextcloud")
+            except Exception:
+                pass
+            return Platform("matrix")
+
     def __init__(self, config: PlatformConfig):
-        super().__init__(config, Platform("nextcloud"))
+        super().__init__(config, self._resolve_platform())
 
         extra = getattr(config, "extra", {}) or {}
 
@@ -770,11 +792,24 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_name=sender_id,
         )
 
+        headers = self.identity_mgr.principal_headers(principal) or {
+            "X-On-Behalf-Of": sender_id,
+            "X-User-Groups": ",".join(groups),
+        }
+        # extra_headers plattformneutral transportieren:
+        # - dict-Sources (Test-Fallback-Base) → Key-Setzung
+        # - reale SessionSource-Objekte (Hermes >= 0.20) → Attribut
+        #   (Dataclass ist nicht frozen; das x-on-behalf-Plugin liest
+        #   getattr(source, "extra_headers"))
         if isinstance(source, dict):
-            source["extra_headers"] = self.identity_mgr.principal_headers(principal) or {
-                "X-On-Behalf-Of": sender_id,
-                "X-User-Groups": ",".join(groups),
-            }
+            source["extra_headers"] = headers
+        else:
+            try:
+                setattr(source, "extra_headers", headers)
+            except Exception:
+                logger.warning(
+                    "Nextcloud: Konnte extra_headers nicht an SessionSource hängen."
+                )
 
         # 13. Session-Key-Korrelation für Cancel/HITL
         session_key = self._build_gateway_session_key(source)
