@@ -555,9 +555,18 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             sender_id
         )
 
-        self.identity_mgr.set_contextvars_identity(
-            sender_id,
-            groups,
+        # Memory-Tag aus der Raum-Beschreibung (Konvention: [memory:team:...])
+        # — skalierbar für neue Räume ohne Plugin-Konfig. Fail-open: Bei API-
+        # Fehlern bleibt die Beschreibung None (→ fallback_scope).
+        room_meta = await self._get_room_meta(room_id) or {}
+        room_description = str(room_meta.get("description") or "") or None
+
+        principal = self.identity_mgr.build_principal(
+            user_id=sender_id,
+            groups=groups,
+            room_id=room_id,
+            is_group_chat=participant_count > 2,
+            conversation_description=room_description,
         )
 
         source = self.build_source(
@@ -569,7 +578,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
 
         if isinstance(source, dict):
-            source["extra_headers"] = {
+            source["extra_headers"] = self.identity_mgr.principal_headers(principal) or {
                 "X-On-Behalf-Of": sender_id,
                 "X-User-Groups": ",".join(groups),
             }
@@ -614,7 +623,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             user_name=sender_id,
         )
 
-        await self.handle_message(msg_event)
+        # Principal-Context als lokaler with-Block um die komplette
+        # Agent-Bearbeitung (Token-Reset im finally — kein Identity-Leak,
+        # kein shared state bei parallelen Events).
+        if principal is not None:
+            with self.identity_mgr.principal_context(principal):
+                await self.handle_message(msg_event)
+        else:
+            await self.handle_message(msg_event)
 
     async def _get_room_meta(self, room_id: str) -> Optional[Dict[str, Any]]:
         """Raum-Metadaten (Existenz + readOnly) mit TTL-Cache abrufen.

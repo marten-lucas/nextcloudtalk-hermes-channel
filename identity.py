@@ -1,21 +1,21 @@
+from __future__ import annotations
+
 import logging
-from typing import Dict, List, Optional, Set
 import time
+from typing import TYPE_CHECKING, Dict, List, Optional, Set
+
+if TYPE_CHECKING:
+    from hermes_x_on_behalf import PrincipalContext
 
 logger = logging.getLogger(__name__)
 
-# Lazy-Import der ContextVars aus hermes-x-on-behalf (optional installiert)
-_xonbehalf_vars: Optional[tuple] = None
 
-
-def _get_xonbehalf_vars() -> Optional[tuple]:
-    """Lädt (current_user_id, current_user_groups) aus hermes-x-on-behalf, falls verfügbar."""
-    global _xonbehalf_vars
-    if _xonbehalf_vars is not None:
-        return _xonbehalf_vars
+def _get_xonbehalf():
+    """Lädt das hermes-x-on-behalf-Paket, falls verfügbar (optional dependency)."""
     try:
-        from hermes_x_on_behalf.plugin import current_user_id, current_user_groups
-        _xonbehalf_vars = (current_user_id, current_user_groups)
+        import hermes_x_on_behalf
+
+        return hermes_x_on_behalf
     except Exception:
         try:
             # Fallback: Plugin-Verzeichnis liegt als Schwesterprojekt im Workspace
@@ -28,14 +28,11 @@ def _get_xonbehalf_vars() -> Optional[tuple]:
                 pkg = type(sys)("hermes_x_on_behalf")
                 pkg.__path__ = [plugin_path]
                 sys.modules.setdefault("hermes_x_on_behalf", pkg)
-                plugin_mod = importlib.import_module("hermes_x_on_behalf.plugin")
-                _xonbehalf_vars = (plugin_mod.current_user_id, plugin_mod.current_user_groups)
-            else:
-                _xonbehalf_vars = (None, None)
+                return importlib.import_module("hermes_x_on_behalf")
+            return None
         except Exception as exc:
-            logger.debug(f"hermes-x-on-behalf ContextVars nicht verfügbar: {exc}")
-            _xonbehalf_vars = (None, None)
-    return _xonbehalf_vars
+            logger.debug(f"hermes-x-on-behalf nicht verfügbar: {exc}")
+            return None
 
 
 class NextcloudIdentityManager:
@@ -95,29 +92,50 @@ class NextcloudIdentityManager:
             logger.warning(f"Konnte Gruppen für User {user_id} nicht abfragen: {e}")
             return set()
 
-    def set_contextvars_identity(self, user_id: str, groups: Set[str]) -> None:
-        """Setzt die ContextVars von hermes-x-on-behalf für die HTTP-Header-Injektion."""
-        vars_pair = _get_xonbehalf_vars()
-        if vars_pair is None or vars_pair[0] is None:
-            return
-        current_user_id, current_user_groups = vars_pair
-        try:
-            current_user_id.set(str(user_id) if user_id else None)
-            current_user_groups.set(",".join(sorted(groups)) if groups else None)
-        except Exception as exc:
-            logger.debug(f"Konnte Identity-ContextVars nicht setzen: {exc}")
+    def build_principal(
+        self,
+        user_id: str,
+        groups: Set[str],
+        room_id: str,
+        is_group_chat: bool,
+        conversation_description: Optional[str] = None,
+    ):
+        """Baut einen PrincipalContext für eine eingehende Nachricht.
 
-    def clear_contextvars_identity(self) -> None:
-        """Räumt die Identity-ContextVars auf (z. B. nach Session-Ende)."""
-        vars_pair = _get_xonbehalf_vars()
-        if vars_pair is None or vars_pair[0] is None:
-            return
-        current_user_id, current_user_groups = vars_pair
+        1:1-Chat: keine Raum-Scopes (conversation_id bleibt leer).
+        Gruppenraum: room_id als conversation_id (+ optionale Memory-Tag-
+        Beschreibung für das deterministische Scope-Routing).
+        """
+        xob = _get_xonbehalf()
+        if xob is None or not user_id:
+            return None
         try:
-            current_user_id.set(None)
-            current_user_groups.set(None)
+            conversation_id = f"talk:room:{room_id}" if (is_group_chat and room_id) else None
+            return xob.PrincipalContext.interactive(
+                user_id=str(user_id),
+                groups=groups,
+                conversation_id=conversation_id,
+                channel="nextcloud-talk",
+                conversation_description=conversation_description,
+            )
         except Exception as exc:
-            logger.debug(f"Konnte Identity-ContextVars nicht leeren: {exc}")
+            logger.debug(f"Konnte PrincipalContext nicht bauen: {exc}")
+            return None
+
+    def principal_context(self, principal):
+        """Context-Manager mit Token-basiertem Set/Reset (leak-proof)."""
+        xob = _get_xonbehalf()
+        return xob.principal_context(principal)
+
+    def principal_headers(self, principal) -> Dict[str, str]:
+        """Leitet die Propagation-Header aus dem PrincipalContext ab."""
+        xob = _get_xonbehalf()
+        if xob is None or principal is None:
+            return {}
+        try:
+            return xob.principal_to_headers(principal)
+        except Exception:
+            return {}
 
     def clear_cache(self) -> None:
         """Clears the internal group cache."""

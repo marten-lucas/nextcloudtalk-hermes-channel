@@ -108,7 +108,7 @@ The adapter processes incoming events through a filter and trigger pipeline:
 9. **Attachments** are extracted and downloaded; empty messages without attachments are ignored
 10. **Group context**: last N messages are fetched and attached as `context_messages`
 11. **Command normalization**: `!command` aliases are resolved to `/command` gateway commands
-12. **Identity**: sender groups are resolved (TTL-cached) and injected as `X-On-Behalf-Of` / `X-User-Groups` headers plus ContextVars for downstream MCP tools
+12. **Identity**: sender groups are resolved (TTL-cached) and propagated as a `PrincipalContext` (via `hermes-x-on-behalf`) — derived `X-On-Behalf-Of` / `X-User-Groups` headers plus token-based ContextVars. The principal context is applied as a **local `with` block around `handle_message`** (no shared adapter state), so concurrently processed messages from different users can never leak identity into each other. For group rooms the conversation id `talk:room:<token>` and the room description are included; a `[memory:team:...]` tag in the room description deterministically routes memory for that room (scales with new rooms, no plugin config needed)
 
 ### Outbound (Hermes → Nextcloud)
 
