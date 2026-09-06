@@ -11,28 +11,38 @@ logger = logging.getLogger(__name__)
 
 
 def _get_xonbehalf():
-    """Lädt das hermes-x-on-behalf-Paket, falls verfügbar (optional dependency)."""
-    try:
-        import hermes_x_on_behalf
+    """Lädt das hermes-x-on-behalf-Paket, falls verfügbar (optional dependency).
 
-        return hermes_x_on_behalf
-    except Exception:
+    Sucht in dieser Reihenfolge:
+    1. ``hermes_x_on_behalf`` (direkt installiert)
+    2. ``hermes_plugins.hermes_x_on_behalf`` (Hermes-Plugin-Loader)
+    3. Schwester-Verzeichnis ``hermes-x-on-behalf`` (Workspace-Layout)
+    """
+    for module_name in ("hermes_x_on_behalf", "hermes_plugins.hermes_x_on_behalf"):
         try:
-            # Fallback: Plugin-Verzeichnis liegt als Schwesterprojekt im Workspace
-            import importlib.util, os, sys
-            plugin_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                "hermes-x-on-behalf",
-            )
-            if os.path.isdir(plugin_path):
-                pkg = type(sys)("hermes_x_on_behalf")
-                pkg.__path__ = [plugin_path]
-                sys.modules.setdefault("hermes_x_on_behalf", pkg)
-                return importlib.import_module("hermes_x_on_behalf")
-            return None
-        except Exception as exc:
-            logger.debug(f"hermes-x-on-behalf nicht verfügbar: {exc}")
-            return None
+            import importlib
+
+            mod = importlib.import_module(module_name)
+            if hasattr(mod, "PrincipalContext"):
+                return mod
+        except Exception:
+            continue
+    try:
+        # Fallback: Plugin-Verzeichnis liegt als Schwesterprojekt im Workspace
+        import importlib.util, os, sys
+        plugin_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "hermes-x-on-behalf",
+        )
+        if os.path.isdir(plugin_path):
+            pkg = type(sys)("hermes_x_on_behalf")
+            pkg.__path__ = [plugin_path]
+            sys.modules.setdefault("hermes_x_on_behalf", pkg)
+            return importlib.import_module("hermes_x_on_behalf")
+        return None
+    except Exception as exc:
+        logger.debug(f"hermes-x-on-behalf nicht verfügbar: {exc}")
+        return None
 
 
 class NextcloudIdentityManager:
