@@ -953,6 +953,33 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
 
 
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        """Hermes platform contract: metadata for a Talk room."""
+        meta = await self._get_room_meta(chat_id) or {}
+        return {
+            "id": chat_id,
+            "target": chat_id,
+            "type": "nextcloud_talk_room",
+            "name": str(meta.get("displayName") or meta.get("name") or chat_id),
+            "participant_count": meta.get("participantCount"),
+            "read_only": meta.get("readOnly"),
+        }
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Hermes platform contract: send a message to a Talk room."""
+        return await self.send_message(
+            room_id=chat_id,
+            text=content,
+            reply_to_message_id=reply_to,
+            metadata=metadata,
+        )
+
     async def send_message(
         self,
         room_id: str,
