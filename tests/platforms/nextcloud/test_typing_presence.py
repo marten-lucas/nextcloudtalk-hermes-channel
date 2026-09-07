@@ -27,23 +27,23 @@ def make_adapter() -> TestableNextcloudTalkPlatform:
 class TypingContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = make_adapter()
-        self.sent: list = []
-        self.adapter.client.ocs_post = AsyncMock(
-            side_effect=lambda path, data=None: self.sent.append(path) or {"id": "x"}
-        )
 
-    async def test_send_typing_starts_refresh_task(self):
+    async def test_send_typing_emits_signaling_event(self):
+        await self.adapter.send_typing("room1")
+        # Sofortiges Signaling-Event gefeuert (startedTyping)
+        self.assertIn(("room1", True), self.adapter.mock_signaling.typing_events)
+        await self.adapter.stop_typing("room1")
+
+    async def test_stop_typing_emits_stopped_event(self):
+        await self.adapter.send_typing("room1")
+        await self.adapter.stop_typing("room1")
+        self.assertIn(("room1", False), self.adapter.mock_signaling.typing_events)
+
+    async def test_send_typing_starts_renew_task(self):
         await self.adapter.send_typing("room1")
         task = self.adapter.presence_mgr._typing_tasks.get("room1")
         self.assertIsNotNone(task)
         self.assertFalse(task.done())
-        await self.adapter.stop_typing("room1")
-
-    async def test_send_typing_refreshes_periodically(self):
-        await self.adapter.send_typing("room1")
-        # Loop posted at least one typing call immediately
-        await asyncio.sleep(0.05)
-        self.assertTrue(any("/typing" in p for p in self.sent))
         await self.adapter.stop_typing("room1")
 
     async def test_send_typing_idempotent_per_room(self):
@@ -62,9 +62,11 @@ class TypingContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_stop_typing_without_task_is_noop(self):
         await self.adapter.stop_typing("never-started")  # darf nicht werfen
 
-    async def test_send_typing_swallows_ocs_errors(self):
-        self.adapter.client.ocs_post = AsyncMock(side_effect=RuntimeError("boom"))
-        # Darf nicht werfen; Loop beendet sich nach dem Fehler selbst
+    async def test_send_typing_swallows_signaling_errors(self):
+        self.adapter.mock_signaling.emit_typing_state = AsyncMock(
+            side_effect=RuntimeError("boom")
+        )
+        # Darf nicht werfen; kein Renew-Task ohne erfolgreiches Initial-Event
         await self.adapter.send_typing("room-err")
         await asyncio.sleep(0.05)
 

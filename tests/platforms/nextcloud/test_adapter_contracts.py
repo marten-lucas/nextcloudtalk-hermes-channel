@@ -143,8 +143,19 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.custom_status_clears.append(force)
 
     def _hooked_presence(self):
-        """Presence-Manager mit Hook-Delegation ersetzen (v0.1.22-Verhalten)."""
+        """Presence-Manager mit Hook-Delegation + Mock-Signaling ersetzen."""
         adapter = self
+
+        class _MockSignaling:
+            """Fängt Typing-Signaling-Events ab (emit_typing_state)."""
+            def __init__(self):
+                self.typing_events = []
+
+            async def emit_typing_state(self, room_id, typing):
+                self.typing_events.append((room_id, typing))
+
+        self.mock_signaling = _MockSignaling()
+        self.presence_mgr.signaling_mgr = self.mock_signaling
 
         class _HookedPresenceManager(type(self.presence_mgr)):
             async def set_presence_status(state_self, state):
@@ -157,6 +168,7 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
                 await adapter._clear_custom_status_message(force=force)
 
         self.presence_mgr = _HookedPresenceManager(self.client)
+        self.presence_mgr.signaling_mgr = self.mock_signaling
 
     async def cancel_session_processing(self, session_key, **kwargs):
         self.cancelled_sessions.append((session_key, kwargs))

@@ -207,7 +207,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         )
 
         self.presence_mgr = NextcloudPresenceManager(
-            self.client
+            self.client,
+            signaling_mgr=None,  # wird nach signaling_mgr-Init verdrahtet
         )
 
         self.attachment_mgr = NextcloudAttachmentManager(
@@ -219,6 +220,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             self.client,
             self.handle_incoming_event,
         )
+        # Presence-Manager mit Signaling verdrahten (Typing läuft über HPB-WS)
+        self.presence_mgr.signaling_mgr = self.signaling_mgr
 
         self._stop_event = asyncio.Event()
         self._polling_task: Optional[asyncio.Task[None]] = None

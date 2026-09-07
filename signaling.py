@@ -42,6 +42,50 @@ class NextcloudSignalingManager:
             user_id=str(data.get("userId") or ""),
         )
 
+    async def emit_typing_state(self, room_id: str, typing: bool) -> None:
+        """Sendet einen Typing-Indikator über das Signaling (HPB-WS).
+
+        Öffnet eine kurzlebige WS-Verbindung (hello -> join room ->
+        startedTyping/stoppedTyping Message) und schließt sie wieder.
+        Genau das Muster aus v0.1.22, wo es gegen diesen Server nachweislich
+        funktionierte — Talk 23 verteilt Typing NICHT via OCS-Endpoint.
+        Fehler werden geloggt, fliegen aber hinauf (Caller entscheidet).
+        """
+        settings = await self.get_signaling_settings(room_id)
+        if not settings:
+            logger.debug("Typing: keine Signaling-Settings für Raum %s", room_id)
+            return
+
+        session_id = self._active_room_sessions.get(room_id)
+        if not session_id:
+            session_id = await self.mark_room_active(room_id)
+        if not session_id:
+            logger.debug("Typing: keine Session-ID für Raum %s", room_id)
+            return
+
+        session = await self.client.ensure_session()
+        signal_type = "startedTyping" if typing else "stoppedTyping"
+        try:
+            async def _send_typing() -> None:
+                async with session.ws_connect(
+                    self.signaling_ws_url(settings.server), heartbeat=30
+                ) as ws:
+                    await self._hello(ws, settings)
+                    await self._join_room(ws, room_id, session_id, settings.user_id)
+                    logger.info("Nextcloud: emitting typing signal for room %s (%s)", room_id, signal_type)
+                    await ws.send_json({
+                        "type": "message",
+                        "message": {
+                            "recipient": {"type": "room"},
+                            "data": {"type": signal_type},
+                        },
+                    })
+                    # Kurz halten, bis der Server die Message verarbeitet hat
+                    await asyncio.sleep(0.5)
+            await asyncio.wait_for(_send_typing(), timeout=8)
+        except Exception as exc:
+            logger.warning("Nextcloud: Typing-Signal für Raum %s fehlgeschlagen: %s", room_id, exc)
+
     async def mark_room_active(self, room_id: str) -> Optional[str]:
         data = await self.client.ocs_post(f"apps/spreed/api/v4/room/{room_id}/participants/active", {"force": True})
         session_id = str(data.get("sessionId") or data.get("sessionid") or "").strip() if isinstance(data, dict) else None

@@ -2,24 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-# Talk-Typing verfällt serverseitig nach ~15 s; wir erneuern alle 5 s.
-_TYPING_REFRESH_INTERVAL = 5.0
-
 
 class NextcloudPresenceManager:
-    """Steuert Presence-Status, Typings und Custom-Status-Nachrichten."""
+    """Steuert Presence-Status, Typings und Custom-Status-Nachrichten.
 
-    def __init__(self, client: Any):
+    Typing läuft über das HPB-Signaling (startedTyping/stoppedTyping WS-
+    Messages) — Talk 23 hat keinen OCS-Typing-Endpoint. Die Signaling-
+    Events verfallen serverseitig nach ~10 s; der Gateway-Loop erneuert
+    alle ~2 s sowieso, wir frischen innerhalb eines kurzlebigen Tasks auf.
+    """
+
+    # Signaling-Typing verfällt nach ~10 s — Refresh etwas früher.
+    _TYPING_TTL = 8.0
+
+    def __init__(self, client: Any, signaling_mgr: Any = None):
         self.client = client
+        self.signaling_mgr = signaling_mgr
         self._current_presence_state: Optional[str] = None
         self._current_custom_status: Optional[tuple[Optional[str], str]] = None
         self._status_text: Dict[str, str] = {}
-        # Typing-Refresh-Tasks pro Raum (send_typing/stop_typing Contract).
+        # Typing-Renew-Tasks pro Raum (send_typing/stop_typing Contract).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         # Referenzzähler für aktive Turns — Presence busy <-> online.
         self._busy_refs: int = 0
@@ -38,13 +44,11 @@ class NextcloudPresenceManager:
         self._current_presence_state = normalized
 
     async def set_busy(self) -> None:
-        """Markiert einen aktiven Turn (Referenzgezählt). Presence -> busy.
-        Der busy-Status ist ein NC-User-Status (online + away=False) mit
-        Custom-Message-Verwaltung durch send_or_update_status."""
+        """Markiert einen aktiven Turn (Referenzgezählt)."""
         self._busy_refs += 1
 
     async def clear_busy(self) -> None:
-        """Turn beendet — zurück auf online, wenn kein Turn mehr aktiv."""
+        """Turn beendet — Referenz freigeben."""
         self._busy_refs = max(0, self._busy_refs - 1)
 
     @property
@@ -54,46 +58,52 @@ class NextcloudPresenceManager:
     async def send_typing(self, chat_id: str) -> None:
         """Startet/erneuert den Typing-Indikator für einen Raum.
 
-        Der Gateway-Loop (_keep_typing) ruft alle ~2 s; wir starten einen
-        Refresh-Task, der alle 5 s den Typing-Status erneuert (Talk verfällt
-        nach ~15 s). Mehrfachaufrufe für denselben Raum idempotent.
+        Sofortiges Signaling-Event + Renew-Task (TTL 8 s), damit der
+        Indikator während des gesamten Turns sichtbar bleibt, ohne dass
+        jeder Gateway-Loop-Tick ein WS-Handshake auslöst.
         """
         room_id = str(chat_id or "").strip()
-        if not room_id:
+        if not room_id or self.signaling_mgr is None:
             return
+        # Sofortiges Event (schnelles Feedback)
+        try:
+            await self.signaling_mgr.emit_typing_state(room_id, True)
+        except Exception as exc:
+            logger.debug("Typing-Event fehlgeschlagen für Raum %s: %s", room_id, exc)
+            return
+        # Renew-Task nur wenn keiner läuft
         existing = self._typing_tasks.get(room_id)
         if existing and not existing.done():
             return
         self._typing_tasks[room_id] = asyncio.create_task(
-            self._typing_refresh_loop(room_id)
+            self._typing_renew_loop(room_id)
         )
 
     async def stop_typing(self, chat_id: str) -> None:
         """Beendet den Typing-Indikator für einen Raum."""
         room_id = str(chat_id or "").strip()
         task = self._typing_tasks.pop(room_id, None)
-        if task is None:
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self.signaling_mgr is None:
             return
-        task.cancel()
         try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+            await self.signaling_mgr.emit_typing_state(room_id, False)
+        except Exception as exc:
+            logger.debug("Typing-Stop fehlgeschlagen für Raum %s: %s", room_id, exc)
 
-    async def _typing_refresh_loop(self, room_id: str) -> None:
-        """Erneuert den Typing-Status periodisch; bricht bei OCS-Fehlern ab."""
+    async def _typing_renew_loop(self, room_id: str) -> None:
+        """Erneuert das Typing-Event alle TTL-Sekunden bis stop_typing."""
         try:
             while True:
-                try:
-                    await self.client.ocs_post(
-                        f"apps/spreed/api/v1/room/{room_id}/typing",
-                        {},
-                    )
-                except Exception as exc:
-                    # 404 = alter Talk ohne Typing-Endpoint — still weg.
-                    logger.debug("Typing-Status für Raum %s nicht gesetzt: %s", room_id, exc)
+                await asyncio.sleep(self._TYPING_TTL)
+                if self.signaling_mgr is None:
                     return
-                await asyncio.sleep(_TYPING_REFRESH_INTERVAL)
+                await self.signaling_mgr.emit_typing_state(room_id, True)
         except asyncio.CancelledError:
             raise
 
