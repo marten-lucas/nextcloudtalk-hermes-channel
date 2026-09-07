@@ -853,12 +853,23 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         # Principal-Context als lokaler with-Block um die komplette
         # Agent-Bearbeitung (Token-Reset im finally — kein Identity-Leak,
-        # kein shared state bei parallelen Events).
-        if principal is not None:
-            with self.identity_mgr.principal_context(principal):
+        # kein shared state bei parallelen Events). Presence busy für die
+        # Turn-Dauer, zurück auf online danach.
+        await self.mark_turn_started()
+        try:
+            if principal is not None:
+                with self.identity_mgr.principal_context(principal):
+                    await self.handle_message(msg_event)
+            else:
                 await self.handle_message(msg_event)
-        else:
-            await self.handle_message(msg_event)
+        finally:
+            await self.mark_turn_finished()
+            # Typing-Indikator spätestens jetzt beenden (safety net — der
+            # Gateway ruft stop_typing normalerweise selbst).
+            try:
+                await self.presence_mgr.stop_typing(room_id)
+            except Exception:
+                pass
 
     async def _get_room_meta(self, room_id: str) -> Optional[Dict[str, Any]]:
         """Raum-Metadaten (Existenz + readOnly) mit TTL-Cache abrufen.
@@ -1332,6 +1343,39 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             await self.presence_mgr.set_custom_status_message(message, icon)
         return SendResult(success=True)
 
+    # ── Typing-Indikator (Gateway-Contract) ─────────────────────────────
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Typing-Indikator im Talk-Raum. Der Gateway-Loop (_keep_typing) ruft
+        alle ~2 s; der Presence-Manager hält pro Raum einen Refresh-Task (Talk
+        verfällt nach ~15 s). Fehler werden geschluckt — Typing darf den
+        Antwortpfad niemals blockieren."""
+        try:
+            await self.presence_mgr.send_typing(chat_id)
+        except Exception:
+            logger.debug("send_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Beendet den Typing-Indikator (Turn-Ende, Fehler, Finalisierung)."""
+        try:
+            await self.presence_mgr.stop_typing(chat_id)
+        except Exception:
+            logger.debug("stop_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
+
+    async def mark_turn_started(self) -> None:
+        """Presence-Marker: ein Turn ist aktiv (Referenzgezählt)."""
+        try:
+            await self.presence_mgr.set_busy()
+        except Exception:
+            logger.debug("set_busy fehlgeschlagen", exc_info=True)
+
+    async def mark_turn_finished(self) -> None:
+        """Presence-Marker: Turn beendet — zurück auf online, wenn letzter."""
+        try:
+            await self.presence_mgr.clear_busy()
+        except Exception:
+            logger.debug("clear_busy fehlgeschlagen", exc_info=True)
+
     @staticmethod
     def _map_progress_status(status_key: str, content: str) -> tuple[Optional[str], Optional[str]]:
         normalized_key = str(status_key or "").strip().lower()
@@ -1341,6 +1385,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return "Liest Kontext", "📖"
         if normalized_key == "_thinking" or normalized_lower.startswith("💬 "):
             return "Denkt nach", "🤔"
+        # Token-Generierung: der letzte API-Call streamt die Antwort — das
+        # Custom-Status zeigt „Antwortet ✍️" während Typing im Chat läuft.
+        if normalized_key in ("_generating", "_responding", "llm.generating"):
+            return "Antwortet", "✍️"
         if normalized_key.startswith("tool.") or "tool" in normalized_key:
             return "Fuehrt Werkzeuge aus", "🛠️"
         if normalized_content:
