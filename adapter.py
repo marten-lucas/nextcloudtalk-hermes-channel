@@ -382,12 +382,28 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         Der innere Loop endet bei WS-Close/Timeout still — ohne Supervisor
         würde der Empfangspfad verlöschen, während der Adapter weiter
-        „verbunden" meldet. Hier wird der Loop alle ``_rx_stall_seconds``-
-        unabhängigen 5 s nach Ende neu gestartet, bis der Adapter stoppt.
+        „verbunden" meldet. Hier wird der Loop alle 5 s nach Ende neu
+        gestartet, bis der Adapter stoppt.
+
+        Wichtig: Bei jedem Reconnect werden die Signaling-Settings NEU
+        geholt — das hello-Auth-Token darin ist zeitlich begrenzt; mit
+        alten Settings schlägt jeder Reconnect mit token_expired fehl
+        (Endlos-Schleife, Empfangspfad dauerhaft tot).
         """
         backoff = 5.0
         while not self._stop_event.is_set():
             try:
+                # Frische Settings pro Reconnect (Token-Refresh)
+                try:
+                    fresh = await self.signaling_mgr.get_signaling_settings(room_id)
+                    if fresh is not None:
+                        settings = fresh
+                except Exception as exc:
+                    logger.debug(
+                        "Nextcloud Talk: Settings-Refresh für Raum %s fehlgeschlagen: %s",
+                        room_id,
+                        exc,
+                    )
                 await self.signaling_mgr.room_signaling_loop(
                     room_id,
                     settings,
@@ -553,18 +569,37 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self,
         room_id: str,
     ) -> List[Dict[str, Any]]:
-        # Bootstrap: erster Poll pro Raum setzt nur den Cursor auf die
-        # neueste Message und dispatcht keine Altlasten (Backlog-Skip).
+        # Bootstrap: erster Poll pro Raum. Statt den Cursor auf die neueste
+        # Message zu setzen (Altlasten-Skip), dispatchen wir die letzten
+        # Nachrichten als Events — das Dedupe (_dispatched_ids) verhindert
+        # Doppelzustellung, und Nachrichten, die während eines Gateway-
+        # Ausfalls/Neustarts ankamen (WS tot, Poll-Cursor alt), gehen nicht
+        # verloren. Nur Nachrichten älter als 10 Minuten werden übersprungen
+        # (echte Altlasten bei erstem Adapter-Start).
         if room_id not in self._poll_bootstrapped_rooms:
+            self._poll_bootstrapped_rooms.add(room_id)
             data = await self.client.ocs_get(
                 f"apps/spreed/api/v1/chat/{room_id}",
                 params={"lookIntoFuture": 0, "limit": 50},
             )
-            latest_id = self._latest_message_id(data if isinstance(data, list) else [])
+            messages = data if isinstance(data, list) else []
+            latest_id = self._latest_message_id(messages)
             if latest_id:
                 self._poll_cursor_by_room[room_id] = latest_id
-            self._poll_bootstrapped_rooms.add(room_id)
-            return []
+
+            cutoff_ts = time.time() - 600  # 10 Minuten
+            recent = [
+                m for m in messages
+                if isinstance(m.get("timestamp"), (int, float))
+                and m["timestamp"] >= cutoff_ts
+            ]
+            if recent:
+                logger.info(
+                    "Nextcloud Talk: Bootstrap Raum %s — %d Nachricht(en) aus dem Ausfall-Fenster nachholen.",
+                    room_id,
+                    len(recent),
+                )
+            return recent
 
         params: Dict[str, Any] = {
             "lookIntoFuture": 0,
