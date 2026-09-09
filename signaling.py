@@ -134,9 +134,12 @@ class NextcloudSignalingManager:
                 heartbeat=30,
             ) as ws:
                 await self._hello(ws, settings)
-                session_id = self._active_room_sessions.get(room_id)
-                if not session_id:
-                    session_id = await self.mark_room_active(room_id)
+                # IMMER eine frische Session holen: HPB invalidiert die alte
+                # Session-ID, sobald ihre WS-Verbindung stirbt. Wiederverwendung
+                # der gecachten ID schlägt beim Room-Join mit dem irreführenden
+                # Fehler 'no_such_room' / 'The user is not invited to this
+                # room.' fehl — Endlos-Reconnect-Loop (Fix 2026-09-09).
+                session_id = await self.mark_room_active(room_id)
                 if not session_id:
                     raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
                 await self._join_room(ws, room_id, session_id, settings.user_id)
