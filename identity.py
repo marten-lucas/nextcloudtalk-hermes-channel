@@ -68,7 +68,17 @@ class NextcloudIdentityManager:
             # Bevorzugt: cloud_ocs_get (Provisioning API v1, korrekter Endpunkt)
             if hasattr(self.client, "cloud_ocs_get"):
                 data = await self.client.cloud_ocs_get(f"users/{user_id}/groups")
-                groups_list = data.get("groups", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                # cloud_ocs_get returns the FULL OCS body ({"ocs": {"meta":..., "data": {...}}}),
+                # unlike ocs_get which unwraps to body["ocs"]["data"]. Also tolerate a client
+                # that already unwraps to the data dict directly.
+                if isinstance(data, dict):
+                    if "ocs" in data:
+                        data = data.get("ocs", {}).get("data", {})
+                    groups_list = data.get("groups", []) if isinstance(data, dict) else []
+                elif isinstance(data, list):
+                    groups_list = data
+                else:
+                    groups_list = []
                 groups = set(groups_list) if isinstance(groups_list, (list, set)) else set()
             elif hasattr(self.client, "get_user_groups"):
                 groups_list = await self.client.get_user_groups(user_id)
