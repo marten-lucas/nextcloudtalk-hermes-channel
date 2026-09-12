@@ -832,7 +832,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         headers = self.identity_mgr.principal_headers(principal) or {
             "X-On-Behalf-Of": sender_id,
-            "X-User-Groups": ",".join(groups),
+            "X-User-Groups": ",".join(g.strip().lower() for g in groups),
         }
         # extra_headers plattformneutral transportieren:
         # - dict-Sources (Test-Fallback-Base) → Key-Setzung
