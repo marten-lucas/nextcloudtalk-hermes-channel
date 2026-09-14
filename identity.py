@@ -157,6 +157,3 @@ class NextcloudIdentityManager:
         except Exception:
             return {}
 
-    def clear_cache(self) -> None:
-        """Clears the internal group cache."""
-        self._group_cache.clear()

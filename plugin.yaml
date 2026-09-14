@@ -23,14 +23,6 @@ requires_env:
     prompt: "Nextcloud app password"
     password: true
 optional_env:
-  - name: NEXTCLOUD_ALLOWED_USERS
-    description: "Comma-separated user IDs allowed to talk to the bot"
-    prompt: "Allowed users (comma-separated)"
-    password: false
-  - name: NEXTCLOUD_ALLOW_ALL_USERS
-    description: "Allow all users to trigger the bot (dev only)"
-    prompt: "Allow all users? (true/false)"
-    password: false
   - name: NEXTCLOUD_BOT_HANDLE
     description: "Mention handle used in group rooms (default: @<NEXTCLOUD_USERNAME>)"
     prompt: "Bot mention handle"
@@ -62,8 +54,4 @@ optional_env:
   - name: NEXTCLOUD_HOME_CHANNEL
     description: "Default room ID for cron/home delivery"
     prompt: "Home room ID"
-    password: false
-  - name: NEXTCLOUD_HOME_CHANNEL_NAME
-    description: "Display name for the Nextcloud home room"
-    prompt: "Home room display name"
     password: false

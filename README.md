@@ -36,8 +36,7 @@ Standalone Hermes plugin, modular structure:
 ├── outbound.py             # Outbound message categorization (lifecycle/error/suppress/forward)
 ├── plugin.yaml             # Plugin metadata
 ├── docs/
-│   ├── nextcloud-talk.md   # Extended documentation
-│   └── restoration-plan.md # Refactor parity plan (historical)
+│   └── nextcloud-talk.md   # Extended documentation
 └── tests/
     └── platforms/nextcloud/test_adapter_contracts.py
 ```
@@ -170,13 +169,10 @@ All other messages sent as normal bot responses:
 | `NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS` | `true` | Require bot mention in rooms with >2 participants |
 | `NEXTCLOUD_CONTEXT_MESSAGE_LIMIT` | `20` | Recent messages to fetch on group trigger |
 | `NEXTCLOUD_POLL_INTERVAL_SECONDS` | `3` | Polling interval when WebSocket unavailable |
-| `NEXTCLOUD_ALLOWED_USERS` | (none) | Comma-separated allowed user IDs (allowlist) |
-| `NEXTCLOUD_ALLOW_ALL_USERS` | `false` | Allow all users (dev/testing only) |
 | `NEXTCLOUD_ALLOWED_ROOMS` | (none) | Comma-separated allowed room tokens (allowlist) |
 | `NEXTCLOUD_ATTACHMENT_TMP_DIR` | (system temp) | Directory for temporary attachment downloads |
 | `NEXTCLOUD_HITL_REQUIRE_REQUESTER` | `true` | Only original requester can approve/reject reactions |
 | `NEXTCLOUD_HOME_CHANNEL` | (none) | Default room ID for cron/scheduled delivery |
-| `NEXTCLOUD_HOME_CHANNEL_NAME` | (none) | Display name for home channel |
 
 ### Room Behavior
 

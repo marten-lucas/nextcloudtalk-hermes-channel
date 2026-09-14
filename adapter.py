@@ -230,7 +230,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._message_index: Dict[str, Dict[str, Any]] = {}
         self._message_session_keys: Dict[str, Dict[str, str]] = {}
         self._session_reset_noted_rooms: set[str] = set()
-        self._sent_message_ids: List[str] = []
         self._room_ws_tasks: Dict[str, asyncio.Task[None]] = {}
         # Cache für Raum-Metadaten (readOnly-Flag), TTL-gesteuert
         self._room_meta_cache: Dict[str, Dict[str, Any]] = {}
@@ -1327,11 +1326,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 if isinstance(data, dict)
                 else None
             )
-
-            # Echo-Ring-Puffer: eigene gesendete Message-IDs merken
-            if msg_id:
-                self._sent_message_ids.append(msg_id)
-                del self._sent_message_ids[:-50]
 
             return SendResult(
                 success=True,

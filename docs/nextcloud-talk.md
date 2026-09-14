@@ -4,7 +4,7 @@
 
 The Nextcloud Talk plugin integrates Hermes Agent with Nextcloud Talk using a custom platform adapter. It is installed as a standalone plugin via the Hermes plugin system.
 
-**Version**: 0.1.23  
+**Version**: 0.3.0  
 **Architecture**: Python async adapter using WebSocket + HTTP polling  
 **Design goal**: Updatefat (no dependencies on Hermes core patches)
 

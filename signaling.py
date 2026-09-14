@@ -93,21 +93,6 @@ class NextcloudSignalingManager:
             self._active_room_sessions[room_id] = session_id
         return session_id
 
-    async def leave_room_active(self, room_id: str) -> None:
-        session_id = self._active_room_sessions.pop(room_id, None)
-        if not session_id:
-            return
-        session = await self.client.ensure_session()
-        try:
-            async with session.delete(
-                self.client.talk_url(f"apps/spreed/api/v4/room/{room_id}/participants/active"),
-                headers=self.client.ocs_headers(),
-            ) as resp:
-                if resp.status >= 400:
-                    logger.warning("Nextcloud: Konnte Raum %s nicht inaktiv setzen: %s", room_id, resp.status)
-        except Exception as exc:
-            logger.warning("Nextcloud: Konnte Raum %s nicht inaktiv setzen: %s", room_id, exc)
-
     @staticmethod
     def signaling_ws_url(server: str) -> str:
         url = server.strip()
