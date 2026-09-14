@@ -15,7 +15,10 @@ Standalone Hermes platform plugin for **Nextcloud Talk** integration.
 - ✅ `!command` → `/command` alias normalization for gateway commands
 - ✅ Sends replies with Nextcloud `replyTo` metadata for visual context linking
 - ✅ Multimodal support: downloads attachments (images, documents) to temp directory
-- ✅ **Voice messages**: recognized and handed to Hermes' built-in STT pipeline (`MessageType.VOICE` + audio `media_urls`); transcription is done centrally by Hermes (see `stt:` config)
+- ✅ **Voice message transcription (STT)**: Voice messages are passed to Hermes as
+  `MessageType.VOICE` with the local audio file — Hermes auto-transcribes them via
+  its built-in STT pipeline (`stt.provider`, e.g. local faster-whisper) and injects
+  the transcript as normal text into the conversation.
 - ✅ Sender identity propagation to Hermes and downstream MCP tools (`X-On-Behalf-Of`, `X-User-Groups`)
 - ✅ Human-in-the-Loop (HITL) approvals via message reactions
 - ✅ Custom presence and status signaling
@@ -106,6 +109,9 @@ The adapter processes incoming events through a filter and trigger pipeline:
 7. **Trigger gating**: 1:1 / 2-participant rooms always trigger; group rooms require `@mention` (configurable)
 8. **Edit/Delete events** re-enter Hermes with contextual text („Nachricht wurde geändert zu …" / „… wurde geloescht.")
 9. **Attachments** are extracted and downloaded; empty messages without attachments are ignored
+   - **Voice messages** (`messageType: "voice-message"` or an audio `messageParameter`)
+     are downloaded and passed to Hermes as `MessageType.VOICE` with the local audio
+     path in `media_urls`/`media_types` — Hermes transcribes them via its STT pipeline.
 10. **Group context**: last N messages are fetched and attached as `context_messages`
 11. **Command normalization**: `!command` aliases are resolved to `/command` gateway commands
 12. **Identity**: sender groups are resolved (TTL-cached) and propagated as a `PrincipalContext` (via `hermes-x-on-behalf`) — derived `X-On-Behalf-Of` / `X-User-Groups` headers plus token-based ContextVars. The principal context is applied as a **local `with` block around `handle_message`** (no shared adapter state), so concurrently processed messages from different users can never leak identity into each other. For group rooms the conversation id `talk:room:<token>` and the room description are included; a `[memory:team:...]` tag in the room description deterministically routes memory for that room (scales with new rooms, no plugin config needed)
@@ -218,6 +224,9 @@ python -m unittest discover -s tests -q
 - **Custom status**: The plugin manages bot presence and custom status automatically; don't manually change it
 - **Message history**: The plugin does not permanently store chat history; context is fetched on-demand when group rooms trigger
 - **Attachments**: Downloaded to temp directory; cleanup is handled by the OS temp file mechanism
+- **Voice messages**: Transcription is delegated to Hermes' STT pipeline — ensure a
+  provider is configured (`stt.provider`) or `faster-whisper` is installed for the
+  `local` provider. See the Hermes `Voice & TTS` docs for the full STT config.
 - **WebSocket**: If WebSocket is unavailable (firewall, network), the adapter automatically falls back to HTTP polling
 
 ---

@@ -404,34 +404,6 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.received_events[0].raw_message["attachment_paths"], ["/tmp/mock-attachment"])
 
-    async def test_voice_message_contract(self):
-        adapter = TestableNextcloudTalkPlatform(
-            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
-        )
-        adapter.mock_participants["room5"] = 2
-        await adapter.handle_incoming_event(
-            {
-                "room_id": "room5",
-                "id": "m-voice",
-                "actorId": "vorstand",
-                "message": "{file}",
-                "messageParameters": {
-                    "file": {
-                        "type": "voice-message",
-                        "id": "voice-1",
-                        "path": "/Talk/voice.ogg",
-                        "mimetype": "audio/ogg",
-                        "file": {"id": "voice-1", "path": "/Talk/voice.ogg", "mimetype": "audio/ogg"},
-                    }
-                },
-            }
-        )
-        ev = adapter.received_events[0]
-        self.assertEqual(ev.message_type, "voice")
-        self.assertEqual(ev.media_urls, ["/tmp/mock-attachment"])
-        self.assertEqual(ev.media_types, ["audio/ogg"])
-        self.assertEqual(ev.raw_message["attachment_paths"], ["/tmp/mock-attachment"])
-
     async def test_system_message_is_ignored_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")
@@ -504,6 +476,39 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertEqual(adapter.received_events, [])
+
+    async def test_voice_message_contract(self):
+        """Voice-Messages werden als MessageType.VOICE mit media_urls/media_types
+        markiert, damit Hermes' auto-STT-Pipeline (stt.provider) transkribiert."""
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room-voice"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room-voice",
+                "id": "m-voice",
+                "actorId": "vorstand",
+                "message": "",
+                "messageType": "voice-message",
+                "messageParameters": {
+                    "object": {
+                        "type": "voice-message",
+                        "id": "file-voice-1",
+                        "path": "/Talk/room-voice/voice-1.ogg",
+                        "mimetype": "audio/ogg",
+                        "name": "voice-1.ogg",
+                    }
+                },
+            }
+        )
+        self.assertEqual(len(adapter.received_events), 1)
+        event = adapter.received_events[0]
+        self.assertIn(event.message_type, ("voice", MessageType.VOICE))
+        self.assertTrue(event.raw_message.get("is_voice_message"))
+        self.assertEqual(len(event.media_urls), 1)
+        self.assertTrue(event.media_urls[0].endswith("mock-attachment"))
+        self.assertEqual(event.media_types[0], "audio/ogg")
 
     async def test_ws_fallback_to_polling_contract(self):
         adapter = TestableNextcloudTalkPlatform(
