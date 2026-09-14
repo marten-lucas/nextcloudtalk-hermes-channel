@@ -17,6 +17,10 @@ class NextcloudAttachmentManager:
         self.client = client
         self.tmp_dir = tmp_dir or tempfile.gettempdir()
 
+    # Parameter-Typen, die wir als Audio/Sprachnachricht behandeln und an
+    # Hermes zur STT-Transkription übergeben (Talk nutzt "voice-message").
+    VOICE_PARAM_TYPES = {"voice-message", "voice", "voice_message"}
+
     def extract_attachments(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         direct = event.get("attachments") or event.get("files") or []
         attachments: List[Dict[str, Any]] = []
@@ -28,18 +32,51 @@ class NextcloudAttachmentManager:
         message_parameters = event.get("messageParameters") or event.get("parameters") or {}
         if isinstance(message_parameters, dict):
             for param in message_parameters.values():
-                if not isinstance(param, dict) or str(param.get("type") or "").lower() != "file":
+                if not isinstance(param, dict):
                     continue
-                attachment: Dict[str, Any] = {}
-                if param.get("id") is not None:
-                    attachment["id"] = param.get("id")
-                if param.get("path"):
-                    attachment["path"] = param.get("path")
-                if param.get("link"):
-                    attachment["url"] = param.get("link")
+                param_type = str(param.get("type") or "").lower()
+
+                # Sprachnachricht: Typ "voice-message" trägt die Audio-Datei oft
+                # als verschachteltes "file"-Objekt unter demselben Parameter.
+                if param_type in self.VOICE_PARAM_TYPES:
+                    nested = param.get("file")
+                    attachment: Dict[str, Any] = {"type": "voice-message"}
+                    if isinstance(nested, dict):
+                        self._fill_from_file_ref(attachment, nested)
+                    else:
+                        self._fill_from_file_ref(attachment, param)
+                    if attachment.get("id") or attachment.get("path") or attachment.get("url"):
+                        attachments.append(attachment)
+                    continue
+
+                if param_type != "file":
+                    continue
+                attachment = {}
+                self._fill_from_file_ref(attachment, param)
                 if attachment:
                     attachments.append(attachment)
         return attachments
+
+    @staticmethod
+    def _fill_from_file_ref(attachment: Dict[str, Any], ref: Dict[str, Any]) -> None:
+        """Übernimmt id/path/url/mimetype aus einer Datei-Referenz."""
+        if ref.get("id") is not None:
+            attachment["id"] = ref.get("id")
+        if ref.get("path"):
+            attachment["path"] = ref.get("path")
+        if ref.get("link"):
+            attachment["url"] = ref.get("link")
+        if ref.get("mimetype"):
+            attachment["mimetype"] = ref.get("mimetype")
+        if ref.get("name"):
+            attachment["name"] = ref.get("name")
+
+    def is_voice_attachment(self, attachment: Dict[str, Any]) -> bool:
+        """True, wenn das Attachment eine Sprachnachricht/Audio ist (STT-Kandidat)."""
+        if str(attachment.get("type") or "").lower() in self.VOICE_PARAM_TYPES:
+            return True
+        mimetype = str(attachment.get("mimetype") or "").lower()
+        return mimetype.startswith("audio/")
 
     async def download_attachment(
         self,

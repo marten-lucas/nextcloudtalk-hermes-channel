@@ -15,6 +15,7 @@ Standalone Hermes platform plugin for **Nextcloud Talk** integration.
 - ✅ `!command` → `/command` alias normalization for gateway commands
 - ✅ Sends replies with Nextcloud `replyTo` metadata for visual context linking
 - ✅ Multimodal support: downloads attachments (images, documents) to temp directory
+- ✅ **Voice messages**: recognized and handed to Hermes' built-in STT pipeline (`MessageType.VOICE` + audio `media_urls`); transcription is done centrally by Hermes (see `stt:` config)
 - ✅ Sender identity propagation to Hermes and downstream MCP tools (`X-On-Behalf-Of`, `X-User-Groups`)
 - ✅ Human-in-the-Loop (HITL) approvals via message reactions
 - ✅ Custom presence and status signaling

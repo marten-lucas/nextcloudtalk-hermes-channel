@@ -404,6 +404,34 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(adapter.received_events[0].raw_message["attachment_paths"], ["/tmp/mock-attachment"])
 
+    async def test_voice_message_contract(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_participants["room5"] = 2
+        await adapter.handle_incoming_event(
+            {
+                "room_id": "room5",
+                "id": "m-voice",
+                "actorId": "vorstand",
+                "message": "{file}",
+                "messageParameters": {
+                    "file": {
+                        "type": "voice-message",
+                        "id": "voice-1",
+                        "path": "/Talk/voice.ogg",
+                        "mimetype": "audio/ogg",
+                        "file": {"id": "voice-1", "path": "/Talk/voice.ogg", "mimetype": "audio/ogg"},
+                    }
+                },
+            }
+        )
+        ev = adapter.received_events[0]
+        self.assertEqual(ev.message_type, "voice")
+        self.assertEqual(ev.media_urls, ["/tmp/mock-attachment"])
+        self.assertEqual(ev.media_types, ["audio/ogg"])
+        self.assertEqual(ev.raw_message["attachment_paths"], ["/tmp/mock-attachment"])
+
     async def test_system_message_is_ignored_contract(self):
         adapter = TestableNextcloudTalkPlatform(
             make_config(base_url="https://nc.local", username="hermes", app_password="pw")

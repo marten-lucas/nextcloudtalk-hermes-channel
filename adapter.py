@@ -39,6 +39,8 @@ except Exception:
     class MessageType:
         TEXT = "text"
         COMMAND = "command"
+        AUDIO = "audio"
+        VOICE = "voice"
 
     @dataclass
     class SendResult:
@@ -56,6 +58,8 @@ except Exception:
         reply_to_message_id: Optional[str] = None
         user_id: Optional[str] = None
         user_name: Optional[str] = None
+        media_urls: List[str] = field(default_factory=list)
+        media_types: List[str] = field(default_factory=list)
 
     class BasePlatformAdapter:
         def __init__(self, config: Any, platform: str = "nextcloud") -> None:
@@ -793,12 +797,23 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 limit=self.runtime.context_message_limit,
             )
 
-        # 11. Attachments herunterladen
+        # 11. Attachments herunterladen + Voice/Audio für STT klassifizieren.
+        # Hermes transkribiert Voice-Messages zentral selbst (stt:-Config);
+        # der Adapter liefert nur die Audio-Datei als media_url + MessageType.VOICE.
         attachment_paths: List[str] = []
+        media_urls: List[str] = []
+        media_types: List[str] = []
+        has_voice = False
         for attachment in attachments:
             path = await self._download_attachment_from_metadata(attachment)
-            if path:
-                attachment_paths.append(path)
+            if not path:
+                continue
+            attachment_paths.append(path)
+            mime = self._attachment_mime(attachment, path)
+            media_urls.append(path)
+            media_types.append(mime)
+            if self.attachment_mgr.is_voice_attachment(attachment) or mime.startswith("audio/"):
+                has_voice = True
 
         # 12. Command-Normalisierung (!cmd -> /cmd)
         body = self._normalize_nextcloud_command(body)
@@ -878,14 +893,26 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         event_payload["is_delete_event"] = is_delete
         event_payload["user_groups"] = list(groups)
 
+        # Voice-Nachricht: DialogTyp auf VOICE setzen + Medien übergeben, damit
+        # Hermes' zentrale STT-Pipeline die Transkription übernimmt. Text bleibt
+        # leer (wird von Hermes aus der Transkription gefüllt).
+        if has_voice:
+            msg_type = MessageType.VOICE
+        elif body.strip().startswith("/"):
+            msg_type = MessageType.COMMAND
+        else:
+            msg_type = MessageType.TEXT
+
         msg_event = MessageEvent(
             text=body,
-            message_type=MessageType.COMMAND if body.strip().startswith("/") else MessageType.TEXT,
+            message_type=msg_type,
             source=source,
             raw_message=event_payload,
             message_id=message_id or None,
             user_id=sender_id,
             user_name=sender_id,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         # Principal-Context als lokaler with-Block um die komplette
@@ -1214,6 +1241,32 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Nextcloud: Attachment-Download fehlgeschlagen: %s", exc)
             return None
+
+    @staticmethod
+    def _attachment_mime(attachment: Dict[str, Any], local_path: str) -> str:
+        """MIME-Typ eines Attachments: Metadaten bevorzugt, sonst Datei-Endung.
+
+        Für Voice-Messages liefert Talk typischerweise kein audio/*-Mimetype;
+        die Endung (z. B. .ogg/.opus/.webm) bestimmt dann den Typ.
+        """
+        mime = str(attachment.get("mimetype") or attachment.get("mimeType") or "").strip()
+        if mime and "/" in mime:
+            return mime.lower()
+        suffix = Path(str(attachment.get("name") or attachment.get("path") or local_path)).suffix.lower()
+        ext_to_mime = {
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".flac": "audio/flac",
+            ".webm": "audio/webm",
+            ".mp4": "audio/mp4",
+            ".wma": "audio/x-ms-wma",
+        }
+        return ext_to_mime.get(suffix, f"application/octet-stream{suffix or ''}")
 
     async def request_human_approval(
         self,
