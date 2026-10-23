@@ -86,6 +86,16 @@ cd ~/.hermes/plugins/nextcloud-talk/
 hermes reload plugins
 ```
 
+After changing `python_dependencies` in this manifest, Hermes must re-admit the plugin so the managed dependency graph includes the new requirement. If the plugin was already enabled, run:
+
+```bash
+hermes plugins disable nextcloud-talk-platform
+hermes plugins enable nextcloud-talk-platform
+hermes gateway restart
+```
+
+`hermes pm repair` rebuilds the recorded dependency graph; it does not discover changes to plugin manifests. Do not install dependencies with system-level `pip`—Hermes uses managed environments.
+
 ### 3. Verify Connection
 
 ```bash
