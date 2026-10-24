@@ -10,7 +10,7 @@ Verträge:
 """
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
     TestableNextcloudTalkPlatform,
@@ -25,6 +25,35 @@ def make_adapter() -> TestableNextcloudTalkPlatform:
     return TestableNextcloudTalkPlatform(
         make_config(base_url="https://nc.local", username="hermes", app_password="pw")
     )
+
+
+class ClientSessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rest_and_websocket_use_separate_connector_policies(self):
+        client = NextcloudTalkClient("https://nc.local", "hermes", "pw")
+        try:
+            rest_session = await client.ensure_session()
+            ws_session = await client.ensure_ws_session()
+
+            self.assertIsNot(rest_session, ws_session)
+            self.assertTrue(rest_session.connector.force_close)
+            self.assertFalse(ws_session.connector.force_close)
+            self.assertEqual(ws_session.connector._keepalive_timeout, 15.0)
+        finally:
+            await client.close()
+
+    async def test_close_closes_both_sessions_and_allows_recreation(self):
+        client = NextcloudTalkClient("https://nc.local", "hermes", "pw")
+        rest_session = await client.ensure_session()
+        ws_session = await client.ensure_ws_session()
+
+        await client.close()
+
+        self.assertTrue(rest_session.closed)
+        self.assertTrue(ws_session.closed)
+        self.assertIsNone(client._session)
+        self.assertIsNone(client._ws_session)
+        self.assertIsNot(await client.ensure_session(), rest_session)
+        await client.close()
 
 
 class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
@@ -143,6 +172,8 @@ class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
 
         queue = asyncio.Queue()
         received_frames = []
+        connected_rooms = []
+        connect_options = {}
         fetch_started = asyncio.Event()
         release_fetch = asyncio.Event()
         second_fetch = asyncio.Event()
@@ -181,11 +212,12 @@ class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
         websocket = FakeWebSocket()
 
         class FakeSession:
-            def ws_connect(self, *_args, **_kwargs):
+            def ws_connect(self, *_args, **kwargs):
+                connect_options.update(kwargs)
                 return websocket
 
         class FakeClient:
-            async def ensure_session(self):
+            async def ensure_ws_session(self):
                 return FakeSession()
 
             def talk_url(self, path):
@@ -224,6 +256,7 @@ class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
                 fetch_room_events,
                 stop_event,
                 on_receive=on_receive,
+                on_connected=connected_rooms.append,
             )
         )
         try:
@@ -234,6 +267,9 @@ class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
                 timeout=0.5,
             )
             self.assertEqual(fetch_count, 1)
+            self.assertEqual(connected_rooms, ["room1"])
+            self.assertEqual(connect_options["heartbeat"], 30.0)
+            self.assertTrue(connect_options["autoping"])
             release_fetch.set()
             await asyncio.wait_for(second_fetch.wait(), timeout=0.5)
         finally:
@@ -251,7 +287,7 @@ class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
 class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_typing_reuses_room_websocket(self):
         client = type("MockClient", (), {})()
-        client.ensure_session = AsyncMock()
+        client.ensure_ws_session = AsyncMock()
         client.ocs_get = AsyncMock()
         manager = NextcloudSignalingManager(client, AsyncMock())
         websocket = type("MockWebSocket", (), {"closed": False})()
@@ -260,7 +296,7 @@ class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
         await manager.emit_typing_state("room1", True)
 
-        client.ensure_session.assert_not_awaited()
+        client.ensure_ws_session.assert_not_awaited()
         client.ocs_get.assert_not_awaited()
         websocket.send_json.assert_awaited_once_with(
             {
@@ -274,7 +310,7 @@ class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_typing_during_reconnect_flushes_latest_state(self):
         client = type("MockClient", (), {})()
-        client.ensure_session = AsyncMock()
+        client.ensure_ws_session = AsyncMock()
         manager = NextcloudSignalingManager(client, AsyncMock())
         await manager.emit_typing_state("room1", True)
         await manager.emit_typing_state("room1", False)
@@ -293,7 +329,7 @@ class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
                 },
             }
         )
-        client.ensure_session.assert_not_awaited()
+        client.ensure_ws_session.assert_not_awaited()
 
 
 class TypingContractTests(unittest.IsolatedAsyncioTestCase):

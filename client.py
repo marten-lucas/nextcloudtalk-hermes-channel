@@ -20,13 +20,14 @@ class NextcloudOCSException(Exception):
 
 
 class NextcloudTalkClient:
-    """Reiner HTTP-Client für Nextcloud OCS REST APIs."""
+    """Nextcloud OCS client with isolated REST and signaling transports."""
 
     def __init__(self, base_url: str, username: str, app_password: str):
         self.base_url = base_url.rstrip("/")
         self.username = username
         self.app_password = app_password
         self._session: Optional[aiohttp.ClientSession] = None
+        self._ws_session: Optional[aiohttp.ClientSession] = None
 
     def auth_header(self) -> str:
         return aiohttp.encode_basic_auth(self.username, self.app_password)
@@ -39,14 +40,25 @@ class NextcloudTalkClient:
         }
 
     async def ensure_session(self) -> aiohttp.ClientSession:
+        """Return the short-lived REST session without pooled keep-alive sockets."""
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            connector = aiohttp.TCPConnector(force_close=True)
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
+    async def ensure_ws_session(self) -> aiohttp.ClientSession:
+        """Return a dedicated session whose connector can retain WS sockets."""
+        if self._ws_session is None or self._ws_session.closed:
+            connector = aiohttp.TCPConnector(keepalive_timeout=15.0)
+            self._ws_session = aiohttp.ClientSession(connector=connector)
+        return self._ws_session
+
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-            self._session = None
+        for session in (self._session, self._ws_session):
+            if session and not session.closed:
+                await session.close()
+        self._session = None
+        self._ws_session = None
 
     def talk_url(self, path: str) -> str:
         return urljoin(f"{self.base_url}/ocs/v2.php/", path.lstrip("/"))

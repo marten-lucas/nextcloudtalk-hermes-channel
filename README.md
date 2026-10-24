@@ -23,6 +23,19 @@ Standalone Hermes platform plugin for **Nextcloud Talk** integration.
 - ✅ Human-in-the-Loop (HITL) approvals via message reactions
 - ✅ Custom presence and status signaling
 
+## Connection health and reconnects
+
+The HPB signaling WebSocket uses its own HTTP session and an RFC WebSocket
+heartbeat (PING/PONG every 30 seconds). An idle room is not treated as a failed
+connection just because it has no chat events; missed PONGs close the transport
+and trigger a reconnect. Reconnects use bounded exponential backoff with jitter,
+reset after a stable connection. OCS REST requests use a separate connector with
+keep-alive disabled to avoid accumulating idle HTTP sockets; both sessions are
+closed when the adapter disconnects.
+
+The long-poll fallback tracks its successful polls separately from WebSocket
+activity, so polling does not mask WebSocket health.
+
 ## Repository layout
 
 Standalone Hermes plugin, modular structure:

@@ -44,6 +44,12 @@ class NextcloudSignalingManager:
             user_id=str(data.get("userId") or ""),
         )
 
+    def get_room_socket(
+        self,
+        room_id: str,
+    ) -> Optional[aiohttp.ClientWebSocketResponse]:
+        return self._room_sockets.get(room_id)
+
     async def emit_typing_state(self, room_id: str, typing: bool) -> None:
         """Send typing state on the room's persistent signaling connection.
 
@@ -113,15 +119,17 @@ class NextcloudSignalingManager:
         fetch_room_events: Any,
         stop_event: Any,
         on_receive: Any = None,
+        on_connected: Any = None,
     ) -> None:
         """Receive room signals without blocking on Nextcloud's long-poll API."""
-        session = await self.client.ensure_session()
+        session = await self.client.ensure_ws_session()
         ws: Optional[aiohttp.ClientWebSocketResponse] = None
         fetch_task: Optional[asyncio.Task] = None
         try:
             async with session.ws_connect(
                 self.signaling_ws_url(settings.server),
-                heartbeat=30,
+                heartbeat=30.0,
+                autoping=True,
             ) as ws:
                 await self._hello(ws, settings)
                 # IMMER eine frische Session holen: HPB invalidiert die alte
@@ -134,6 +142,8 @@ class NextcloudSignalingManager:
                     raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
                 await self._join_room(ws, room_id, session_id, settings.user_id)
                 self._room_sockets[room_id] = ws
+                if on_connected is not None:
+                    on_connected(room_id)
                 await self._flush_pending_typing(room_id, ws)
 
                 fetch_requested = asyncio.Event()

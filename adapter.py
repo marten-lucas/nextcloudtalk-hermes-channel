@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -247,10 +248,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._room_meta_ttl_seconds: float = 300.0
 
         # ── Empfangs-Überwachung (Resilience) ──
-        # Letzter empfangener Event/Poll pro Raum (time.monotonic).
+        # Anwendungsaktivität und Transport-/Poll-Aktivität getrennt halten.
         self._last_rx: Dict[str, float] = {}
-        # Watchdog-Task: prükt periodisch, ob Empfangspfade gestorben
-        # oder gestalled sind, und startet sie neu.
+        self._last_ws_rx: Dict[str, float] = {}
+        self._ws_connected_at: Dict[str, float] = {}
+        self._last_poll_success: Dict[str, float] = {}
+        # Aiohttp-Heartbeat erkennt tote WS-Transporte; der Watchdog startet
+        # nur beendete oder geschlossene Verbindungen neu, nicht stille Räume.
         self._watchdog_task: Optional[asyncio.Task[None]] = None
         # Periodisches Low-Frequency-Polling läuft IMMER als Sicherheitsschicht
         # unter dem WebSocket-Pfad (Dedupe über _poll_cursor/_message_index).
@@ -258,10 +262,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             os.getenv("NEXTCLOUD_LOWFREQ_POLLING", "true")
         ).lower() in {"1", "true", "yes"}
         self._lfp_interval_seconds: float = 60.0
-        # Ein WS-Empfang gilt nach so vielen Sekunden ohne Event als stalled.
-        self._rx_stall_seconds: float = float(
-            os.getenv("NEXTCLOUD_RX_STALL_SECONDS", "180")
-        )
+        self._ws_reconnect_initial_seconds = 5.0
+        self._ws_reconnect_max_seconds = 120.0
+        self._ws_reconnect_stable_seconds = 60.0
+        self._ws_reconnect_jitter = 0.2
 
 
     @property
@@ -307,7 +311,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if self._lfp_enabled:
             self._start_polling_loop()
 
-        # Watchdog: überwacht WS-Tasks und Empfangsaktivität.
+        # Watchdog: startet beendete/geschlossene WS-Tasks neu.
         self._start_watchdog()
 
         await self.presence_mgr.set_presence_status(
@@ -345,6 +349,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._watchdog_task = None
         self._room_ws_tasks = {}
         self._event_dispatch_tasks = {}
+        self._ws_connected_at.clear()
 
         await self.presence_mgr.set_presence_status(
             "offline"
@@ -370,7 +375,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._ensure_event_dispatcher(room_id, queue)
 
     def _mark_room_received(self, room_id: str) -> None:
-        self._last_rx[str(room_id)] = time.monotonic()
+        now = time.monotonic()
+        room_key = str(room_id)
+        self._last_rx[room_key] = now
+        self._last_ws_rx[room_key] = now
+
+    def _mark_room_ws_connected(self, room_id: str) -> None:
+        now = time.monotonic()
+        room_key = str(room_id)
+        self._last_ws_rx[room_key] = now
+        self._ws_connected_at[room_key] = now
 
     async def _fetch_room_events_serialized(self, room_id: str) -> List[Dict[str, Any]]:
         """Serialize WS-triggered and polling fetches for one room's cursor."""
@@ -442,17 +456,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     ) -> None:
         """Supervidiert den WS-Signaling-Loop eines Raums mit Auto-Reconnect.
 
-        Der innere Loop endet bei WS-Close/Timeout still — ohne Supervisor
-        würde der Empfangspfad verlöschen, während der Adapter weiter
-        „verbunden" meldet. Hier wird der Loop alle 5 s nach Ende neu
-        gestartet, bis der Adapter stoppt.
+        Der Supervisor verbindet nach Abbrüchen mit begrenztem exponentiellem
+        Backoff und Jitter erneut, bis der Adapter stoppt.
 
         Wichtig: Bei jedem Reconnect werden die Signaling-Settings NEU
         geholt — das hello-Auth-Token darin ist zeitlich begrenzt; mit
         alten Settings schlägt jeder Reconnect mit token_expired fehl
         (Endlos-Schleife, Empfangspfad dauerhaft tot).
         """
-        backoff = 5.0
+        backoff = self._ws_reconnect_initial_seconds
         while not self._stop_event.is_set():
             try:
                 # Frische Settings pro Reconnect (Token-Refresh)
@@ -472,26 +484,46 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                     self._fetch_room_events_serialized,
                     self._stop_event,
                     on_receive=self._mark_room_received,
+                    on_connected=self._mark_room_ws_connected,
                 )
                 if self._stop_event.is_set():
                     return
                 logger.warning(
-                    "Nextcloud Talk: WS für Raum %s endete — Reconnect in %.0fs",
+                    "Nextcloud Talk: WS für Raum %s endete.",
                     room_id,
-                    backoff,
                 )
             except asyncio.CancelledError:
+                self._ws_connected_at.pop(room_id, None)
                 raise
             except Exception as exc:
-                if self._stop_event.is_set():
-                    return
-                logger.warning(
-                    "Nextcloud Talk: WS für Raum %s crashte: %s — Reconnect in %.0fs",
-                    room_id,
-                    exc,
-                    backoff,
-                )
-            await asyncio.sleep(backoff)
+                if not self._stop_event.is_set():
+                    logger.warning(
+                        "Nextcloud Talk: WS für Raum %s crashte: %s",
+                        room_id,
+                        exc,
+                    )
+            connected_at = self._ws_connected_at.pop(room_id, None)
+            if self._stop_event.is_set():
+                return
+
+            if (
+                connected_at is not None
+                and time.monotonic() - connected_at >= self._ws_reconnect_stable_seconds
+            ):
+                backoff = self._ws_reconnect_initial_seconds
+            delay = self._jittered_reconnect_delay(backoff)
+            logger.info(
+                "Nextcloud Talk: Reconnect für Raum %s in %.1fs (Backoff %.1fs).",
+                room_id,
+                delay,
+                backoff,
+            )
+            await asyncio.sleep(delay)
+            backoff = min(backoff * 2, self._ws_reconnect_max_seconds)
+
+    def _jittered_reconnect_delay(self, backoff: float) -> float:
+        jitter = self._ws_reconnect_jitter
+        return random.uniform(backoff * (1.0 - jitter), backoff * (1.0 + jitter))
 
     def _start_watchdog(self) -> None:
         if self._watchdog_task and not self._watchdog_task.done():
@@ -499,12 +531,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
 
     async def _watchdog_loop(self) -> None:
-        """Erkennt tote/gestallte Empfangspfade und startet sie neu.
+        """Startet beendete oder explizit geschlossene WS-Empfangspfade neu.
 
         Kriterien pro Raum:
         - WS-Task done → sofort neu starten
-        - Kein RX seit ``_rx_stall_seconds`` (WS lebt, HPB liefert nichts) →
-          Task killen und neu starten (Supervisor übernimmt den Reconnect).
+        - Socket explizit geschlossen → Task neu starten
+
+        Ein stiller Raum ist kein Beleg für einen defekten WS. Aiohttp sendet
+        RFC-WebSocket-Pings und bricht bei ausbleibendem Pong den Socket ab;
+        der Supervisor übernimmt dann den Reconnect.
         """
         while not self._stop_event.is_set():
             try:
@@ -525,15 +560,17 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                         await self._restart_room_ws(room_id)
                         continue
 
-                    last_rx = self._last_rx.get(room_id)
-                    if (
-                        last_rx is not None
-                        and (now - last_rx) > self._rx_stall_seconds
-                    ):
+                    ws = self.signaling_mgr.get_room_socket(room_id)
+                    if ws is not None and ws.closed:
+                        last_ws_rx = self._last_ws_rx.get(room_id)
+                        idle_seconds = (
+                            now - last_ws_rx if last_ws_rx is not None else 0.0
+                        )
                         logger.warning(
-                            "Nextcloud Talk: Watchdog — kein Empfang in Raum %s seit %.0fs; starte WS neu.",
+                            "Nextcloud Talk: Watchdog — WS für Raum %s ist geschlossen "
+                            "(letzter Anwendungsframe vor %.0fs); starte neu.",
                             room_id,
-                            now - last_rx,
+                            idle_seconds,
                         )
                         await self._restart_room_ws(room_id)
             except asyncio.CancelledError:
@@ -562,11 +599,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             # Raum ggf. nicht mehr vorhanden — Task-Eintrag entfernen.
             self._room_ws_tasks.pop(room_id, None)
             self._last_rx.pop(room_id, None)
+            self._last_ws_rx.pop(room_id, None)
+            self._ws_connected_at.pop(room_id, None)
+            self._last_poll_success.pop(room_id, None)
             return
+        self._ws_connected_at.pop(room_id, None)
         self._room_ws_tasks[room_id] = asyncio.create_task(
             self._supervised_room_loop(room_id, settings)
         )
-        self._last_rx[room_id] = time.monotonic()
 
     async def _list_joined_rooms(self) -> List[str]:
         data = await self.client.ocs_get(
@@ -599,10 +639,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
                         # Rooms are polled concurrently: Talk's lookIntoFuture
                         # endpoint can hold each request for about 30 seconds.
-                        # Serial requests across eight rooms starve the watchdog.
-                        self._last_rx[room_id] = time.monotonic()
                         try:
                             events = await self._fetch_room_events_serialized(room_id)
+                            self._last_poll_success[room_id] = time.monotonic()
                             for event in events:
                                 await self._enqueue_incoming_event(event)
                         except asyncio.CancelledError:
@@ -721,7 +760,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self,
         event: Dict[str, Any],
     ) -> None:
-        # RX-Zeitstempel für den Watchdog (Stall-Erkennung).
+        # Anwendungsaktivität getrennt von der WS-Transportgesundheit erfassen.
         room_id = str(event.get("room_id") or "")
         if room_id:
             self._last_rx[room_id] = time.monotonic()

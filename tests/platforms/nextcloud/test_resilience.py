@@ -2,7 +2,7 @@
 
 Deckt die Maßnahmen nach dem Empfangs-Ausfall vom 2026-09-06 ab:
 1. WS-Loops laufen unter einem Supervisor mit Auto-Reconnect.
-2. Der Watchdog startet done/gestallte WS-Tasks neu.
+2. Der Watchdog startet beendete/geschlossene WS-Tasks neu; stille Räume bleiben bestehen.
 3. Low-Frequency-Polling läuft dauerhaft als Sicherheitsschicht.
 4. ``is_connected`` meldet nur lebendige Empfangspfade als verbunden.
 """
@@ -78,33 +78,55 @@ class WatchdogContractTests(unittest.IsolatedAsyncioTestCase):
         adapter._restart_room_ws = AsyncMock()
 
         # Eine Watchdog-Iteration manuell ausführen (Loop-Körper extrahiert):
-        now = time.monotonic()
         for room_id, task in list(adapter._room_ws_tasks.items()):
             if task.done():
                 await adapter._restart_room_ws(room_id)
                 continue
-            last_rx = adapter._last_rx.get(room_id)
-            if last_rx is not None and (now - last_rx) > adapter._rx_stall_seconds:
+            ws = adapter.signaling_mgr.get_room_socket(room_id)
+            if ws is not None and ws.closed:
                 await adapter._restart_room_ws(room_id)
 
         adapter._restart_room_ws.assert_awaited_once_with("room1")
 
-    async def test_watchdog_restarts_stalled_room(self):
+    async def test_watchdog_does_not_restart_idle_room_when_polling_is_active(self):
         adapter = make_adapter()
         adapter._stop_event.clear()
         live = asyncio.create_task(asyncio.sleep(10))
         adapter._room_ws_tasks["room1"] = live
-        # Letzter Empfang deutlich zurückliegend
-        adapter._last_rx["room1"] = time.monotonic() - adapter._rx_stall_seconds - 1
+        adapter._last_ws_rx["room1"] = time.monotonic() - 600
+        adapter._last_poll_success["room1"] = time.monotonic()
+        adapter.signaling_mgr.get_room_socket = lambda _room: type(
+            "Socket", (), {"closed": False}
+        )()
         adapter._restart_room_ws = AsyncMock()
 
-        now = time.monotonic()
         for room_id, task in list(adapter._room_ws_tasks.items()):
             if task.done():
                 await adapter._restart_room_ws(room_id)
                 continue
-            last_rx = adapter._last_rx.get(room_id)
-            if last_rx is not None and (now - last_rx) > adapter._rx_stall_seconds:
+            ws = adapter.signaling_mgr.get_room_socket(room_id)
+            if ws is not None and ws.closed:
+                await adapter._restart_room_ws(room_id)
+
+        adapter._restart_room_ws.assert_not_awaited()
+        live.cancel()
+
+    async def test_watchdog_restarts_explicitly_closed_socket(self):
+        adapter = make_adapter()
+        adapter._stop_event.clear()
+        live = asyncio.create_task(asyncio.sleep(10))
+        adapter._room_ws_tasks["room1"] = live
+        adapter.signaling_mgr.get_room_socket = lambda _room: type(
+            "Socket", (), {"closed": True}
+        )()
+        adapter._restart_room_ws = AsyncMock()
+
+        for room_id, task in list(adapter._room_ws_tasks.items()):
+            if task.done():
+                await adapter._restart_room_ws(room_id)
+                continue
+            ws = adapter.signaling_mgr.get_room_socket(room_id)
+            if ws is not None and ws.closed:
                 await adapter._restart_room_ws(room_id)
 
         adapter._restart_room_ws.assert_awaited_once_with("room1")
@@ -132,8 +154,10 @@ class WatchdogContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("room1", adapter._room_ws_tasks)
         new_task = adapter._room_ws_tasks["room1"]
         self.assertIsNot(new_task, old)
-        self.assertIn("room1", adapter._last_rx)
+        self.assertNotIn("room1", adapter._last_ws_rx)
+        self.assertNotIn("room1", adapter._ws_connected_at)
         new_task.cancel()
+        await asyncio.gather(new_task, return_exceptions=True)
 
     async def test_restart_aborts_when_room_settings_unavailable(self):
         adapter = make_adapter()
@@ -147,76 +171,125 @@ class WatchdogContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("room1", adapter._room_ws_tasks)
         self.assertNotIn("room1", adapter._last_rx)
+        self.assertNotIn("room1", adapter._last_ws_rx)
+        self.assertNotIn("room1", adapter._ws_connected_at)
+        self.assertNotIn("room1", adapter._last_poll_success)
 
 
 class SupervisedLoopContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_supervised_loop_reconnects_after_inner_loop_end(self):
+    async def test_supervisor_jitters_backoff_and_resets_after_stability(self):
+        from unittest.mock import call, patch
+
+        import adapter as adapter_module
+
         adapter = make_adapter()
         adapter._stop_event.clear()
+        adapter._ws_reconnect_stable_seconds = 0.005
         calls = []
+        delays = []
+        original_sleep = asyncio.sleep
 
-        async def fake_inner(room_id, settings, fetch, stop_event, on_receive=None):
+        async def fake_inner(
+            room_id, settings, fetch, stop_event, on_receive=None, on_connected=None
+        ):
             calls.append(room_id)
-            if len(calls) >= 3:
+            if on_connected is not None:
+                on_connected(room_id)
+            if len(calls) == 3:
+                await original_sleep(0.01)
+            elif len(calls) == 4:
                 adapter._stop_event.set()
-                return
-            # erster/zweiter Durchlauf: sofortiges Ende (simulierter WS-Close)
+
+        async def capture_sleep(delay):
+            delays.append(delay)
+
+        def lower_jitter_bound(low, _high):
+            return low
 
         adapter.signaling_mgr.room_signaling_loop = fake_inner
-        # Backoff für den Test stark verkürzen
-        supervised = adapter._supervised_room_loop("room1", object())
-        async_fast = asyncio.wait_for(supervised, timeout=2.0)
+        with (
+            patch.object(adapter_module.asyncio, "sleep", capture_sleep),
+            patch.object(
+                adapter_module.random, "uniform", side_effect=lower_jitter_bound
+            ) as jitter,
+        ):
+            await asyncio.wait_for(
+                adapter._supervised_room_loop("room1", object()),
+                timeout=1.0,
+            )
 
-        # Wir müssen das sleep(5)-Backoff umgehen: patch asyncio.sleep im Modul
+        self.assertEqual(calls, ["room1"] * 4)
+        self.assertEqual(delays, [4.0, 8.0, 4.0])
+        self.assertEqual(
+            jitter.call_args_list,
+            [call(4.0, 6.0), call(8.0, 12.0), call(4.0, 6.0)],
+        )
+
+    async def test_supervised_loop_caps_exponential_backoff(self):
+        from unittest.mock import patch
+
         import adapter as adapter_module
-        orig_sleep = adapter_module.asyncio.sleep
 
-        async def fast_sleep(delay, *a, **kw):
-            return await orig_sleep(min(delay, 0.01) if delay == 5.0 else delay)
+        adapter = make_adapter()
+        adapter._stop_event.clear()
+        adapter._ws_reconnect_max_seconds = 10.0
+        adapter._ws_reconnect_stable_seconds = 999.0
+        calls = []
+        delays = []
 
-        adapter_module.asyncio.sleep = fast_sleep
-        try:
-            await asyncio.wait_for(supervised, timeout=2.0)
-        finally:
-            adapter_module.asyncio.sleep = orig_sleep
+        async def fake_inner(
+            room_id, settings, fetch, stop_event, on_receive=None, on_connected=None
+        ):
+            calls.append(room_id)
+            if len(calls) == 5:
+                adapter._stop_event.set()
 
-        self.assertEqual(calls, ["room1", "room1", "room1"])
+        async def capture_sleep(delay):
+            delays.append(delay)
+
+        def lower_jitter_bound(low, _high):
+            return low
+
+        adapter.signaling_mgr.room_signaling_loop = fake_inner
+        with (
+            patch.object(adapter_module.asyncio, "sleep", capture_sleep),
+            patch.object(
+                adapter_module.random, "uniform", side_effect=lower_jitter_bound
+            ),
+        ):
+            await asyncio.wait_for(
+                adapter._supervised_room_loop("room1", object()),
+                timeout=1.0,
+            )
+
+        self.assertEqual(calls, ["room1"] * 5)
+        self.assertEqual(delays, [4.0, 8.0, 8.0, 8.0])
 
     async def test_supervised_loop_survives_inner_exception(self):
+        from unittest.mock import patch
+
+        import adapter as adapter_module
+
         adapter = make_adapter()
         adapter._stop_event.clear()
         calls = []
 
-        async def fake_inner(room_id, settings, fetch, stop_event, on_receive=None):
+        async def fake_inner(
+            room_id, settings, fetch, stop_event, on_receive=None, on_connected=None
+        ):
             calls.append(room_id)
+            if len(calls) >= 2:
+                adapter._stop_event.set()
             raise RuntimeError("ws boom")
 
+        async def no_wait(_delay):
+            return None
+
         adapter.signaling_mgr.room_signaling_loop = fake_inner
+        with patch.object(adapter_module.asyncio, "sleep", no_wait):
+            await adapter._supervised_room_loop("room1", object())
 
-        import adapter as adapter_module
-        orig_sleep = adapter_module.asyncio.sleep
-
-        async def fast_sleep(delay, *a, **kw):
-            return await orig_sleep(min(delay, 0.01) if delay == 5.0 else delay)
-
-        # sleep permanent patchen (auch für den im Task laufenden Supervisor)
-        adapter_module.asyncio.sleep = fast_sleep
-        supervised = asyncio.create_task(
-            adapter._supervised_room_loop("room1", object())
-        )
-        try:
-            # Mehrere Crash/Reconnect-Zyklen zulassen (fast_sleep macht die
-            # 5s-Backoffs real nur 10ms lang).
-            await orig_sleep(0.5)
-        finally:
-            adapter_module.asyncio.sleep = orig_sleep
-            adapter._stop_event.set()
-            supervised.cancel()
-            try:
-                await supervised
-            except (asyncio.CancelledError, Exception):
-                pass
-        self.assertGreaterEqual(len(calls), 2)
+        self.assertEqual(calls, ["room1", "room1"])
 
 
 class DedupeContractTests(unittest.IsolatedAsyncioTestCase):
