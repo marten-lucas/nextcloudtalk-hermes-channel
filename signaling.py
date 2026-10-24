@@ -26,6 +26,8 @@ class NextcloudSignalingManager:
         self.client = client
         self.event_handler = event_handler
         self._active_room_sessions: Dict[str, str] = {}
+        self._room_sockets: Dict[str, aiohttp.ClientWebSocketResponse] = {}
+        self._pending_typing: Dict[str, bool] = {}
 
     async def get_signaling_settings(self, room_id: str) -> Optional[NextcloudSignalingSettings]:
         data = await self.client.ocs_get("apps/spreed/api/v3/signaling/settings", params={"token": room_id})
@@ -43,48 +45,48 @@ class NextcloudSignalingManager:
         )
 
     async def emit_typing_state(self, room_id: str, typing: bool) -> None:
-        """Sendet einen Typing-Indikator über das Signaling (HPB-WS).
+        """Send typing state on the room's persistent signaling connection.
 
-        Öffnet eine kurzlebige WS-Verbindung (hello -> join room ->
-        startedTyping/stoppedTyping Message) und schließt sie wieder.
-        Genau das Muster aus v0.1.22, wo es gegen diesen Server nachweislich
-        funktionierte — Talk 23 verteilt Typing NICHT via OCS-Endpoint.
-        Fehler werden geloggt, fliegen aber hinauf (Caller entscheidet).
+        A second websocket using the same Nextcloud room session displaces the
+        receive socket on this HPB, so typing updates must share that socket.
+        Keep only the latest state when the room is reconnecting.
         """
-        settings = await self.get_signaling_settings(room_id)
-        if not settings:
-            logger.debug("Typing: keine Signaling-Settings für Raum %s", room_id)
+        ws = self._room_sockets.get(room_id)
+        if ws is None or ws.closed:
+            self._pending_typing[room_id] = bool(typing)
             return
-
-        session_id = self._active_room_sessions.get(room_id)
-        if not session_id:
-            session_id = await self.mark_room_active(room_id)
-        if not session_id:
-            logger.debug("Typing: keine Session-ID für Raum %s", room_id)
-            return
-
-        session = await self.client.ensure_session()
-        signal_type = "startedTyping" if typing else "stoppedTyping"
         try:
-            async def _send_typing() -> None:
-                async with session.ws_connect(
-                    self.signaling_ws_url(settings.server), heartbeat=30
-                ) as ws:
-                    await self._hello(ws, settings)
-                    await self._join_room(ws, room_id, session_id, settings.user_id)
-                    logger.info("Nextcloud: emitting typing signal for room %s (%s)", room_id, signal_type)
-                    await ws.send_json({
-                        "type": "message",
-                        "message": {
-                            "recipient": {"type": "room"},
-                            "data": {"type": signal_type},
-                        },
-                    })
-                    # Kurz halten, bis der Server die Message verarbeitet hat
-                    await asyncio.sleep(0.5)
-            await asyncio.wait_for(_send_typing(), timeout=8)
-        except Exception as exc:
-            logger.warning("Nextcloud: Typing-Signal für Raum %s fehlgeschlagen: %s", room_id, exc)
+            await self._send_typing_state(ws, typing)
+        except Exception:
+            self._pending_typing[room_id] = bool(typing)
+            raise
+
+    async def _send_typing_state(
+        self,
+        ws: aiohttp.ClientWebSocketResponse,
+        typing: bool,
+    ) -> None:
+        signal_type = "startedTyping" if typing else "stoppedTyping"
+        await ws.send_json({
+            "type": "message",
+            "message": {
+                "recipient": {"type": "room"},
+                "data": {"type": signal_type},
+            },
+        })
+
+    async def _flush_pending_typing(
+        self,
+        room_id: str,
+        ws: aiohttp.ClientWebSocketResponse,
+    ) -> None:
+        typing = self._pending_typing.pop(room_id, None)
+        if typing is not None:
+            try:
+                await self._send_typing_state(ws, typing)
+            except Exception:
+                self._pending_typing[room_id] = typing
+                raise
 
     async def mark_room_active(self, room_id: str) -> Optional[str]:
         data = await self.client.ocs_post(f"apps/spreed/api/v4/room/{room_id}/participants/active", {"force": True})
@@ -113,6 +115,7 @@ class NextcloudSignalingManager:
     ) -> None:
         """WebSocket-Signaling-Loop für einen Raum: Events triggern Poll-Fetch."""
         session = await self.client.ensure_session()
+        ws: Optional[aiohttp.ClientWebSocketResponse] = None
         try:
             async with session.ws_connect(
                 self.signaling_ws_url(settings.server),
@@ -128,6 +131,8 @@ class NextcloudSignalingManager:
                 if not session_id:
                     raise RuntimeError(f"Nextcloud signaling join missing session id for room {room_id}")
                 await self._join_room(ws, room_id, session_id, settings.user_id)
+                self._room_sockets[room_id] = ws
+                await self._flush_pending_typing(room_id, ws)
                 async for msg in ws:
                     if stop_event.is_set():
                         return
@@ -155,6 +160,9 @@ class NextcloudSignalingManager:
                     logger.debug("Nextcloud websocket transport closed for %s: %s", room_id, exc)
                 else:
                     logger.warning("Nextcloud websocket room loop ended for %s: %s", room_id, exc)
+        finally:
+            if ws is not None and self._room_sockets.get(room_id) is ws:
+                self._room_sockets.pop(room_id, None)
 
     async def _hello(self, ws: aiohttp.ClientWebSocketResponse, settings: NextcloudSignalingSettings) -> None:
         hello_version = "2.0" if settings.hello_auth_params.get("2.0") else "1.0"

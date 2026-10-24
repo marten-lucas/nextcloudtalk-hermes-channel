@@ -18,6 +18,7 @@ from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
 )
 from _ncplugin_under_test.client import NextcloudTalkClient
 from _ncplugin_under_test.presence import NextcloudPresenceManager
+from _ncplugin_under_test.signaling import NextcloudSignalingManager
 
 
 def make_adapter() -> TestableNextcloudTalkPlatform:
@@ -132,6 +133,54 @@ class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
         client.ocs_delete_core.assert_awaited_once_with(
             "apps/user_status/api/v1/user_status/message"
         )
+
+
+class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
+    async def test_typing_reuses_room_websocket(self):
+        client = type("MockClient", (), {})()
+        client.ensure_session = AsyncMock()
+        client.ocs_get = AsyncMock()
+        manager = NextcloudSignalingManager(client, AsyncMock())
+        websocket = type("MockWebSocket", (), {"closed": False})()
+        websocket.send_json = AsyncMock()
+        manager._room_sockets["room1"] = websocket
+
+        await manager.emit_typing_state("room1", True)
+
+        client.ensure_session.assert_not_awaited()
+        client.ocs_get.assert_not_awaited()
+        websocket.send_json.assert_awaited_once_with(
+            {
+                "type": "message",
+                "message": {
+                    "recipient": {"type": "room"},
+                    "data": {"type": "startedTyping"},
+                },
+            }
+        )
+
+    async def test_typing_during_reconnect_flushes_latest_state(self):
+        client = type("MockClient", (), {})()
+        client.ensure_session = AsyncMock()
+        manager = NextcloudSignalingManager(client, AsyncMock())
+        await manager.emit_typing_state("room1", True)
+        await manager.emit_typing_state("room1", False)
+
+        websocket = type("MockWebSocket", (), {"closed": False})()
+        websocket.send_json = AsyncMock()
+        await manager._flush_pending_typing("room1", websocket)
+
+        self.assertNotIn("room1", manager._pending_typing)
+        websocket.send_json.assert_awaited_once_with(
+            {
+                "type": "message",
+                "message": {
+                    "recipient": {"type": "room"},
+                    "data": {"type": "stoppedTyping"},
+                },
+            }
+        )
+        client.ensure_session.assert_not_awaited()
 
 
 class TypingContractTests(unittest.IsolatedAsyncioTestCase):
