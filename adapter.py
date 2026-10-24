@@ -222,7 +222,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         self.signaling_mgr = NextcloudSignalingManager(
             self.client,
-            self.handle_incoming_event,
+            self._enqueue_incoming_event,
         )
         # Presence-Manager mit Signaling verdrahten (Typing läuft über HPB-WS)
         self.presence_mgr.signaling_mgr = self.signaling_mgr
@@ -235,6 +235,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._message_session_keys: Dict[str, Dict[str, str]] = {}
         self._session_reset_noted_rooms: set[str] = set()
         self._room_ws_tasks: Dict[str, asyncio.Task[None]] = {}
+        # Slow agent turns must not block websocket reads or the polling loop.
+        # One FIFO worker per room preserves message order while receive loops
+        # continue handling heartbeats and reconnects.
+        self._event_queues: Dict[str, asyncio.Queue[Dict[str, Any]]] = {}
+        self._event_dispatch_tasks: Dict[str, asyncio.Task[None]] = {}
         # Cache für Raum-Metadaten (readOnly-Flag), TTL-gesteuert
         self._room_meta_cache: Dict[str, Dict[str, Any]] = {}
         self._room_meta_cache_ts: Dict[str, float] = {}
@@ -281,6 +286,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         is_reconnect: bool = False,
     ) -> bool:
         self._stop_event.clear()
+        for room_id, queue in self._event_queues.items():
+            if not queue.empty():
+                self._ensure_event_dispatcher(room_id, queue)
 
         await self.client.ensure_session()
 
@@ -324,6 +332,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 self._polling_task,
                 self._watchdog_task,
                 *self._room_ws_tasks.values(),
+                *self._event_dispatch_tasks.values(),
             )
             if task
         ]
@@ -334,6 +343,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._polling_task = None
         self._watchdog_task = None
         self._room_ws_tasks = {}
+        self._event_dispatch_tasks = {}
 
         await self.presence_mgr.set_presence_status(
             "offline"
@@ -349,6 +359,45 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._polling_task = asyncio.create_task(
             self._polling_loop()
         )
+
+    async def _enqueue_incoming_event(self, event: Dict[str, Any]) -> None:
+        """Queue an event without making its transport wait for agent work."""
+        room_id = str(event.get("room_id") or event.get("token") or "__unknown__")
+        self._last_rx[room_id] = time.monotonic()
+        queue = self._event_queues.setdefault(room_id, asyncio.Queue())
+        queue.put_nowait(event)
+        self._ensure_event_dispatcher(room_id, queue)
+
+    def _ensure_event_dispatcher(
+        self,
+        room_id: str,
+        queue: asyncio.Queue[Dict[str, Any]],
+    ) -> None:
+        task = self._event_dispatch_tasks.get(room_id)
+        if task is None or task.done():
+            self._event_dispatch_tasks[room_id] = asyncio.create_task(
+                self._dispatch_room_events(room_id, queue)
+            )
+
+    async def _dispatch_room_events(
+        self,
+        room_id: str,
+        queue: asyncio.Queue[Dict[str, Any]],
+    ) -> None:
+        """Process each room FIFO while its websocket and polling stay live."""
+        while not self._stop_event.is_set():
+            event = await queue.get()
+            try:
+                await self.handle_incoming_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Nextcloud Talk: Event-Verarbeitung für Raum %s fehlgeschlagen.",
+                    room_id,
+                )
+            finally:
+                queue.task_done()
 
     async def _connect_websocket_once(self) -> bool:
         """Versucht, WebSocket-Signaling für alle erlaubten Räume zu starten."""
@@ -551,9 +600,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                         )
 
                         for event in events:
-                            await self.handle_incoming_event(
-                                event
-                            )
+                            await self._enqueue_incoming_event(event)
 
             except asyncio.CancelledError:
                 raise
@@ -1396,6 +1443,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         """Status-Contract: Fortschritt als Custom-Presence statt Chat-Nachricht."""
         message, icon = self._map_progress_status(status_key, content)
         if message:
+            room_meta = await self._get_room_meta(chat_id) or {}
+            room_label = str(
+                room_meta.get("displayName") or room_meta.get("name") or ""
+            ).strip()
+            if room_label and room_label != str(chat_id):
+                if len(room_label) > 32:
+                    room_label = room_label[:31].rstrip() + "…"
+                message = f"{room_label} · {message}"
             self.presence_mgr.set_status_text(chat_id, message)
             await self.presence_mgr.set_custom_status_message(message, icon)
         return SendResult(success=True)
@@ -1413,11 +1468,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             logger.debug("send_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Beendet den Typing-Indikator (Turn-Ende, Fehler, Finalisierung)."""
+        """Beendet Typing und räumt den globalen KI-Status auf, falls idle."""
         try:
             await self.presence_mgr.stop_typing(chat_id)
         except Exception:
             logger.debug("stop_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
+        finally:
+            await self._clear_idle_user_status()
 
     async def mark_turn_started(self) -> None:
         """Presence-Marker: ein Turn ist aktiv (Referenzgezählt)."""
@@ -1427,11 +1484,22 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             logger.debug("set_busy fehlgeschlagen", exc_info=True)
 
     async def mark_turn_finished(self) -> None:
-        """Presence-Marker: Turn beendet — zurück auf online, wenn letzter."""
+        """Turn beendet — Status des KI-Users wie bei Deck zurücksetzen."""
         try:
             await self.presence_mgr.clear_busy()
         except Exception:
             logger.debug("clear_busy fehlgeschlagen", exc_info=True)
+        await self._clear_idle_user_status()
+
+    async def _clear_idle_user_status(self) -> None:
+        """Custom-Status nur löschen, wenn kein anderer Raum mehr aktiv ist."""
+        if self.presence_mgr.is_busy:
+            return
+        try:
+            await self.presence_mgr.clear_custom_status_message(force=True)
+            await self.presence_mgr.set_presence_status("online")
+        except Exception:
+            logger.debug("Talk-User-Status beim Turn-Ende nicht bereinigt", exc_info=True)
 
     @staticmethod
     def _map_progress_status(status_key: str, content: str) -> tuple[Optional[str], Optional[str]]:

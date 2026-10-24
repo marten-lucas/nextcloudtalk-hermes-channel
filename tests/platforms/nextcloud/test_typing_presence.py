@@ -16,12 +16,122 @@ from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
     TestableNextcloudTalkPlatform,
     make_config,
 )
+from _ncplugin_under_test.client import NextcloudTalkClient
+from _ncplugin_under_test.presence import NextcloudPresenceManager
 
 
 def make_adapter() -> TestableNextcloudTalkPlatform:
     return TestableNextcloudTalkPlatform(
         make_config(base_url="https://nc.local", username="hermes", app_password="pw")
     )
+
+
+class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_client_puts_core_ocs_payload_as_json(self):
+        requests = []
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            async def json(self):
+                return {"ocs": {"meta": {"status": "ok", "statuscode": 200}, "data": {}}}
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Session:
+            closed = False
+
+            def request(self, method, url, **kwargs):
+                requests.append((method, url, kwargs))
+                return ResponseContext()
+
+        client = NextcloudTalkClient("https://nc.local", "hermes", "pw")
+        client._session = Session()
+        payload = {"statusType": "busy"}
+
+        await client.ocs_put_core(
+            "apps/user_status/api/v1/user_status/status",
+            payload,
+        )
+
+        method, url, kwargs = requests[0]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(
+            url,
+            "https://nc.local/ocs/v2.php/apps/user_status/api/v1/user_status/status",
+        )
+        self.assertEqual(kwargs["json"], payload)
+        self.assertNotIn("data", kwargs)
+
+    async def test_talk_client_uses_json_for_core_ocs_status_updates(self):
+        requests = []
+
+        class Response:
+            status = 200
+            headers = {"Content-Type": "application/json"}
+
+            async def json(self):
+                return {"ocs": {"meta": {"status": "ok", "statuscode": 200}, "data": {}}}
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Session:
+            closed = False
+
+            def request(self, method, url, **kwargs):
+                requests.append((method, url, kwargs))
+                return ResponseContext()
+
+        client = NextcloudTalkClient("https://nc.local", "hermes", "pw")
+        client._session = Session()
+        payload = {"message": "Antwortet", "statusIcon": "✍️"}
+
+        await client.ocs_put_core(
+            "apps/user_status/api/v1/user_status/message/custom",
+            payload,
+        )
+
+        method, url, kwargs = requests[0]
+        self.assertEqual(method, "PUT")
+        self.assertEqual(
+            url,
+            "https://nc.local/ocs/v2.php/apps/user_status/api/v1/user_status/message/custom",
+        )
+        self.assertEqual(kwargs["json"], payload)
+        self.assertNotIn("data", kwargs)
+
+    async def test_presence_uses_deck_compatible_core_ocs_json_calls(self):
+        client = type("MockClient", (), {})()
+        client.ocs_put_core = AsyncMock(return_value={})
+        client.ocs_delete_core = AsyncMock(return_value={})
+        presence = NextcloudPresenceManager(client)
+
+        await presence.set_presence_status("busy")
+        await presence.set_custom_status_message("Antwortet", "✍️")
+        await presence.clear_custom_status_message()
+
+        client.ocs_put_core.assert_any_await(
+            "apps/user_status/api/v1/user_status/status",
+            {"statusType": "busy"},
+        )
+        client.ocs_put_core.assert_any_await(
+            "apps/user_status/api/v1/user_status/message/custom",
+            {"message": "Antwortet", "statusIcon": "✍️"},
+        )
+        client.ocs_delete_core.assert_awaited_once_with(
+            "apps/user_status/api/v1/user_status/message"
+        )
 
 
 class TypingContractTests(unittest.IsolatedAsyncioTestCase):
@@ -96,6 +206,28 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         mgr = self.adapter.presence_mgr
         await self.adapter.mark_turn_finished()
         self.assertFalse(mgr.is_busy)
+
+    async def test_last_turn_clears_global_custom_status(self):
+        await self.adapter.mark_turn_started()
+        await self.adapter.mark_turn_started()
+        await self.adapter.send_or_update_status("room1", "_thinking", "")
+
+        await self.adapter.mark_turn_finished()
+        self.assertTrue(self.adapter.presence_mgr.is_busy)
+        self.assertEqual(self.adapter.custom_status_clears, [])
+
+        await self.adapter.mark_turn_finished()
+        self.assertFalse(self.adapter.presence_mgr.is_busy)
+        self.assertEqual(self.adapter.custom_status_clears, [True])
+        self.assertEqual(self.adapter.presence_updates[-1], "online")
+
+    async def test_stop_typing_clears_custom_status_without_turn_hooks(self):
+        await self.adapter.send_or_update_status("room1", "_generating", "")
+
+        await self.adapter.stop_typing("room1")
+
+        self.assertEqual(self.adapter.custom_status_clears, [True])
+        self.assertEqual(self.adapter.presence_updates[-1], "online")
 
     async def test_handle_incoming_event_sets_busy(self):
         adapter = make_adapter()

@@ -51,6 +51,49 @@ class NextcloudTalkClient:
     def talk_url(self, path: str) -> str:
         return urljoin(f"{self.base_url}/ocs/v2.php/", path.lstrip("/"))
 
+    def core_ocs_url(self, path: str) -> str:
+        """OCS root for core apps such as Nextcloud user_status."""
+        return urljoin(f"{self.base_url}/ocs/v2.php/", path.lstrip("/"))
+
+    async def ocs_put_core(self, path: str, payload: Dict[str, Any]) -> Any:
+        """JSON OCS PUT for Nextcloud core APIs (e.g. user_status)."""
+        return await self._ocs_core_request("PUT", path, payload=payload)
+
+    async def ocs_delete_core(self, path: str) -> Any:
+        """OCS DELETE for Nextcloud core APIs (e.g. clearing user_status)."""
+        return await self._ocs_core_request("DELETE", path)
+
+    async def _ocs_core_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        session = await self.ensure_session()
+        kwargs: Dict[str, Any] = {"headers": self.ocs_headers()}
+        if payload is not None:
+            kwargs["json"] = payload
+        async with session.request(
+            method,
+            self.core_ocs_url(path),
+            params={"format": "json"},
+            **kwargs,
+        ) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "application/json" in content_type:
+                body = await resp.json()
+            else:
+                raw_text = await resp.text()
+                body = {
+                    "ocs": {
+                        "meta": {"status": "ok", "statuscode": resp.status},
+                        "data": raw_text,
+                    }
+                }
+        self._raise_for_ocs_error(path, body)
+        return body.get("ocs", {}).get("data")
+
     def cloud_ocs_url(self, path: str) -> str:
         return urljoin(f"{self.base_url}/ocs/v1.php/cloud/", path.lstrip("/"))
 

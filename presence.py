@@ -40,7 +40,10 @@ class NextcloudPresenceManager:
         normalized = str(state or "").strip().lower()
         if normalized == self._current_presence_state:
             return
-        await self.client.ocs_put("apps/user_status/api/v1/user_status/status", {"statusType": normalized})
+        await self.client.ocs_put_core(
+            "apps/user_status/api/v1/user_status/status",
+            {"statusType": normalized},
+        )
         self._current_presence_state = normalized
 
     async def set_busy(self) -> None:
@@ -117,11 +120,14 @@ class NextcloudPresenceManager:
         if status_icon:
             payload["statusIcon"] = status_icon
 
-        await self.client.ocs_put("apps/user_status/api/v1/user_status/message/custom", payload)
+        await self.client.ocs_put_core(
+            "apps/user_status/api/v1/user_status/message/custom",
+            payload,
+        )
         self._current_custom_status = new_state
 
     async def clear_custom_status_message(self, *, force: bool = False) -> None:
         if self._current_custom_status is None and not force:
             return
-        await self.client.ocs_delete("apps/user_status/api/v1/user_status/message")
+        await self.client.ocs_delete_core("apps/user_status/api/v1/user_status/message")
         self._current_custom_status = None

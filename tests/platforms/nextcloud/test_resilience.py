@@ -237,6 +237,48 @@ class DedupeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(adapter.received_events), 1)
 
 
+class EventDispatchContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_turn_does_not_block_receive_and_room_order_is_preserved(self):
+        adapter = make_adapter()
+        adapter._stop_event.clear()
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        processed = []
+
+        async def slow_turn(event):
+            processed.append(event["id"])
+            if event["id"] == "first":
+                first_started.set()
+                await release_first.wait()
+
+        adapter.handle_incoming_event = slow_turn
+        first = {"room_id": "room1", "id": "first"}
+        second = {"room_id": "room1", "id": "second"}
+        try:
+            await adapter._enqueue_incoming_event(first)
+            await asyncio.wait_for(first_started.wait(), timeout=0.5)
+
+            rx_before_second = adapter._last_rx["room1"]
+            await asyncio.wait_for(
+                adapter._enqueue_incoming_event(second), timeout=0.1
+            )
+
+            queue = adapter._event_queues["room1"]
+            self.assertEqual(processed, ["first"])
+            self.assertEqual(queue.qsize(), 1)
+            self.assertGreaterEqual(adapter._last_rx["room1"], rx_before_second)
+
+            release_first.set()
+            await asyncio.wait_for(queue.join(), timeout=1.0)
+            self.assertEqual(processed, ["first", "second"])
+        finally:
+            release_first.set()
+            task = adapter._event_dispatch_tasks.get("room1")
+            if task and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+
 class LowFrequencyPollingContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_connect_starts_polling_even_with_ws_success(self):
         adapter = make_adapter()

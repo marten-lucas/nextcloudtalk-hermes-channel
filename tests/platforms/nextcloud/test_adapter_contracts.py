@@ -650,6 +650,19 @@ class NextcloudAdapterContractTests(unittest.IsolatedAsyncioTestCase):
         await adapter.send_or_update_status("room10", "tool.started", "Running tool")
         self.assertEqual(adapter.custom_status_updates[-1], ("Fuehrt Werkzeuge aus", "🛠️"))
 
+    async def test_status_update_includes_room_context(self):
+        adapter = TestableNextcloudTalkPlatform(
+            make_config(base_url="https://nc.local", username="hermes", app_password="pw")
+        )
+        adapter.mock_room_meta["room10"] = {"displayName": "Vorstand"}
+
+        await adapter.send_or_update_status("room10", "tool.started", "Running tool")
+
+        self.assertEqual(
+            adapter.custom_status_updates[-1],
+            ("Vorstand · Fuehrt Werkzeuge aus", "🛠️"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
