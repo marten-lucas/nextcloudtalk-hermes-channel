@@ -112,10 +112,12 @@ class NextcloudSignalingManager:
         settings: NextcloudSignalingSettings,
         fetch_room_events: Any,
         stop_event: Any,
+        on_receive: Any = None,
     ) -> None:
-        """WebSocket-Signaling-Loop für einen Raum: Events triggern Poll-Fetch."""
+        """Receive room signals without blocking on Nextcloud's long-poll API."""
         session = await self.client.ensure_session()
         ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        fetch_task: Optional[asyncio.Task] = None
         try:
             async with session.ws_connect(
                 self.signaling_ws_url(settings.server),
@@ -133,24 +135,57 @@ class NextcloudSignalingManager:
                 await self._join_room(ws, room_id, session_id, settings.user_id)
                 self._room_sockets[room_id] = ws
                 await self._flush_pending_typing(room_id, ws)
+
+                fetch_requested = asyncio.Event()
+
+                async def fetch_after_signal() -> None:
+                    while not stop_event.is_set():
+                        await fetch_requested.wait()
+                        fetch_requested.clear()
+                        if stop_event.is_set():
+                            return
+                        try:
+                            events = await fetch_room_events(room_id)
+                            for event_payload in events:
+                                await self.event_handler(event_payload)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Nextcloud Talk: Signaling-Fetch für Raum %s fehlgeschlagen: %s",
+                                room_id,
+                                exc,
+                            )
+
+                fetch_task = asyncio.create_task(fetch_after_signal())
                 async for msg in ws:
                     if stop_event.is_set():
                         return
                     if msg.type != aiohttp.WSMsgType.TEXT:
-                        if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                        if msg.type in (
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.ERROR,
+                        ):
+                            logger.warning(
+                                "Nextcloud signaling socket closed for room %s "
+                                "(frame=%s, code=%s).",
+                                room_id,
+                                msg.type.name,
+                                ws.close_code,
+                            )
                             break
                         continue
+                    if on_receive is not None:
+                        on_receive(room_id)
                     payload = json.loads(msg.data)
                     if payload.get("type") == "event":
                         event = payload.get("event") or {}
                         if isinstance(event, dict) and event.get("target") in {"room", "participants"}:
-                            events = await fetch_room_events(room_id)
-                            for event_payload in events:
-                                await self.event_handler(event_payload)
+                            fetch_requested.set()
                     elif payload.get("type") == "room":
-                        events = await fetch_room_events(room_id)
-                        for event_payload in events:
-                            await self.event_handler(event_payload)
+                        fetch_requested.set()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -161,6 +196,9 @@ class NextcloudSignalingManager:
                 else:
                     logger.warning("Nextcloud websocket room loop ended for %s: %s", room_id, exc)
         finally:
+            if fetch_task is not None:
+                fetch_task.cancel()
+                await asyncio.gather(fetch_task, return_exceptions=True)
             if ws is not None and self._room_sockets.get(room_id) is ws:
                 self._room_sockets.pop(room_id, None)
 

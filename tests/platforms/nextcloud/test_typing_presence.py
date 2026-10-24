@@ -135,6 +135,119 @@ class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_chat_fetch_does_not_block_ws_receive_loop(self):
+        import json
+        import aiohttp
+        from _ncplugin_under_test.signaling import NextcloudSignalingSettings
+
+        queue = asyncio.Queue()
+        received_frames = []
+        fetch_started = asyncio.Event()
+        release_fetch = asyncio.Event()
+        second_fetch = asyncio.Event()
+        fetch_count = 0
+
+        class FakeMessage:
+            def __init__(self, payload=None, msg_type=aiohttp.WSMsgType.TEXT):
+                self.type = msg_type
+                self.data = json.dumps(payload) if payload is not None else ""
+
+        class FakeWebSocket:
+            closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                self.closed = True
+
+            async def send_json(self, payload):
+                if payload.get("type") == "hello":
+                    await queue.put(FakeMessage({"type": "hello"}))
+                elif payload.get("type") == "room":
+                    await queue.put(FakeMessage({"type": "room"}))
+                    await queue.put(FakeMessage({"type": "event", "event": {"target": "room"}}))
+
+            async def receive(self):
+                return await queue.get()
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                return await self.receive()
+
+        websocket = FakeWebSocket()
+
+        class FakeSession:
+            def ws_connect(self, *_args, **_kwargs):
+                return websocket
+
+        class FakeClient:
+            async def ensure_session(self):
+                return FakeSession()
+
+            def talk_url(self, path):
+                return f"https://nc.local/ocs/v2.php/{path}"
+
+            async def ocs_post(self, *_args, **_kwargs):
+                return {"sessionId": "session-1"}
+
+        async def fetch_room_events(_room_id):
+            nonlocal fetch_count
+            fetch_count += 1
+            if fetch_count == 1:
+                fetch_started.set()
+                await release_fetch.wait()
+            elif fetch_count == 2:
+                second_fetch.set()
+            return []
+
+        async def handle_event(_event):
+            return None
+
+        manager = NextcloudSignalingManager(FakeClient(), handle_event)
+        stop_event = asyncio.Event()
+
+        def on_receive(_room_id):
+            received_frames.append(True)
+
+        task = asyncio.create_task(
+            manager.room_signaling_loop(
+                "room1",
+                NextcloudSignalingSettings(
+                    server="https://signal.local",
+                    hello_auth_params={"1.0": {"token": "test"}},
+                    user_id="hermes",
+                ),
+                fetch_room_events,
+                stop_event,
+                on_receive=on_receive,
+            )
+        )
+        try:
+            await asyncio.wait_for(fetch_started.wait(), timeout=0.5)
+            await queue.put(FakeMessage({"type": "event", "event": {"target": "room"}}))
+            await asyncio.wait_for(
+                self._wait_for_frames(received_frames, 2),
+                timeout=0.5,
+            )
+            self.assertEqual(fetch_count, 1)
+            release_fetch.set()
+            await asyncio.wait_for(second_fetch.wait(), timeout=0.5)
+        finally:
+            release_fetch.set()
+            stop_event.set()
+            await queue.put(FakeMessage(msg_type=aiohttp.WSMsgType.CLOSE))
+            await asyncio.wait_for(task, timeout=0.5)
+
+    @staticmethod
+    async def _wait_for_frames(received_frames, count):
+        while len(received_frames) < count:
+            await asyncio.sleep(0)
+
+
 class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
     async def test_typing_reuses_room_websocket(self):
         client = type("MockClient", (), {})()

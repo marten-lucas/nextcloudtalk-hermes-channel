@@ -155,7 +155,7 @@ class SupervisedLoopContractTests(unittest.IsolatedAsyncioTestCase):
         adapter._stop_event.clear()
         calls = []
 
-        async def fake_inner(room_id, settings, fetch, stop_event):
+        async def fake_inner(room_id, settings, fetch, stop_event, on_receive=None):
             calls.append(room_id)
             if len(calls) >= 3:
                 adapter._stop_event.set()
@@ -187,7 +187,7 @@ class SupervisedLoopContractTests(unittest.IsolatedAsyncioTestCase):
         adapter._stop_event.clear()
         calls = []
 
-        async def fake_inner(room_id, settings, fetch, stop_event):
+        async def fake_inner(room_id, settings, fetch, stop_event, on_receive=None):
             calls.append(room_id)
             raise RuntimeError("ws boom")
 

@@ -231,6 +231,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._polling_task: Optional[asyncio.Task[None]] = None
         self._poll_cursor_by_room: Dict[str, str] = {}
         self._poll_bootstrapped_rooms: set[str] = set()
+        self._room_fetch_locks: Dict[str, asyncio.Lock] = {}
         self._message_index: Dict[str, Dict[str, Any]] = {}
         self._message_session_keys: Dict[str, Dict[str, str]] = {}
         self._session_reset_noted_rooms: set[str] = set()
@@ -368,6 +369,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         queue.put_nowait(event)
         self._ensure_event_dispatcher(room_id, queue)
 
+    def _mark_room_received(self, room_id: str) -> None:
+        self._last_rx[str(room_id)] = time.monotonic()
+
+    async def _fetch_room_events_serialized(self, room_id: str) -> List[Dict[str, Any]]:
+        """Serialize WS-triggered and polling fetches for one room's cursor."""
+        lock = self._room_fetch_locks.setdefault(room_id, asyncio.Lock())
+        async with lock:
+            return await self._fetch_room_events(room_id)
+
     def _ensure_event_dispatcher(
         self,
         room_id: str,
@@ -459,8 +469,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 await self.signaling_mgr.room_signaling_loop(
                     room_id,
                     settings,
-                    self._fetch_room_events,
+                    self._fetch_room_events_serialized,
                     self._stop_event,
+                    on_receive=self._mark_room_received,
                 )
                 if self._stop_event.is_set():
                     return
@@ -579,28 +590,31 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 )
 
                 if isinstance(rooms, list):
-                    for room in rooms:
-                        room_id = str(
-                            room.get("token", "")
-                            or room.get("id", "")
-                        )
-
+                    async def poll_room(room: Dict[str, Any]) -> None:
+                        room_id = str(room.get("token", "") or room.get("id", ""))
                         if not room_id:
-                            continue
-
+                            return
                         if self.runtime.allowed_rooms and room_id not in self.runtime.allowed_rooms:
-                            continue
+                            return
 
-                        # RX-Zeitstempel auch für Polls pflegen — der Watchdog
-                        # behandelt Polling als gültigen Empfangspfad.
+                        # Rooms are polled concurrently: Talk's lookIntoFuture
+                        # endpoint can hold each request for about 30 seconds.
+                        # Serial requests across eight rooms starve the watchdog.
                         self._last_rx[room_id] = time.monotonic()
+                        try:
+                            events = await self._fetch_room_events_serialized(room_id)
+                            for event in events:
+                                await self._enqueue_incoming_event(event)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as exc:
+                            logger.warning(
+                                "Nextcloud Talk: Polling für Raum %s fehlgeschlagen: %s",
+                                room_id,
+                                exc,
+                            )
 
-                        events = await self._fetch_room_events(
-                            room_id
-                        )
-
-                        for event in events:
-                            await self._enqueue_incoming_event(event)
+                    await asyncio.gather(*(poll_room(room) for room in rooms))
 
             except asyncio.CancelledError:
                 raise
