@@ -18,9 +18,9 @@ from .client import NextcloudOCSException, NextcloudTalkClient
 from .hitl import HITLManager
 from .identity import NextcloudIdentityManager
 from .outbound import categorize_gateway_message
+from .platform_wip import finish_platform_turn, start_platform_turn
 from .presence import NextcloudPresenceManager
 from .signaling import NextcloudSignalingManager
-
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +388,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if self._speed_session and not self._speed_session.closed:
             await self._speed_session.close()
         self._speed_session = None
+        for room_key, active_count in tuple(self._active_turn_rooms.items()):
+            for _ in range(active_count):
+                finish_platform_turn("talk", room_key)
         self._active_turn_rooms.clear()
         for room_key in self._room_progress_status:
             self.presence_mgr.set_status_text(room_key, None)
@@ -1583,6 +1586,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         if room_key not in self._active_turn_rooms:
             self._active_turn_rooms[room_key] = 1
+            start_platform_turn("talk", room_key)
             await self.presence_mgr.set_busy()
         self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
         self._speed_status_room = room_key
@@ -1610,6 +1614,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return
         self._room_status_idle_tasks.pop(room_key, None)
         active_count = self._active_turn_rooms.pop(room_key, 0)
+        for _ in range(active_count):
+            finish_platform_turn("talk", room_key)
         self._room_progress_status.pop(room_key, None)
         self.presence_mgr.set_status_text(room_key, None)
         if self._speed_status_room == room_key:
@@ -1628,6 +1634,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         room_key = str(chat_id or "").strip()
         if room_key:
             self._active_turn_rooms[room_key] = self._active_turn_rooms.get(room_key, 0) + 1
+            start_platform_turn("talk", room_key)
             self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
             self._speed_status_room = room_key
         async with self._user_status_lock:
@@ -1649,6 +1656,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 self.presence_mgr.set_status_text(room_key, None)
             else:
                 self._active_turn_rooms[room_key] = active_count - 1
+            if active_count > 0:
+                finish_platform_turn("talk", room_key)
             if self._speed_status_room == room_key:
                 self._speed_status_room = next(
                     reversed(self._active_turn_rooms), None
@@ -1676,6 +1685,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if idle_tasks:
                 await asyncio.gather(*idle_tasks, return_exceptions=True)
             self._room_status_idle_tasks.clear()
+            for room_key, active_count in tuple(self._active_turn_rooms.items()):
+                for _ in range(active_count):
+                    finish_platform_turn("talk", room_key)
             self._active_turn_rooms.clear()
             for room_key in self._room_progress_status:
                 self.presence_mgr.set_status_text(room_key, None)

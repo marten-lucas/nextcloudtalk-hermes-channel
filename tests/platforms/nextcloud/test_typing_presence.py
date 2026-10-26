@@ -10,15 +10,17 @@ Verträge:
 """
 import asyncio
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
+
+from _ncplugin_under_test.client import NextcloudTalkClient
+from _ncplugin_under_test.platform_wip import active_platform_turns
+from _ncplugin_under_test.presence import NextcloudPresenceManager
+from _ncplugin_under_test.signaling import NextcloudSignalingManager
 
 from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
     TestableNextcloudTalkPlatform,
     make_config,
 )
-from _ncplugin_under_test.client import NextcloudTalkClient
-from _ncplugin_under_test.presence import NextcloudPresenceManager
-from _ncplugin_under_test.signaling import NextcloudSignalingManager
 
 
 def make_adapter() -> TestableNextcloudTalkPlatform:
@@ -164,9 +166,31 @@ class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SharedPlatformWipTests(unittest.IsolatedAsyncioTestCase):
+    async def test_talk_typing_lifecycle_is_visible_to_deck_wip(self):
+        adapter = make_adapter()
+        adapter._room_status_idle_grace_seconds = 0
+        adapter._ensure_speed_heartbeat = Mock()
+        adapter._clear_idle_user_status = AsyncMock()
+        adapter.presence_mgr.set_presence_status = AsyncMock()
+        adapter.presence_mgr.set_busy = AsyncMock()
+        adapter.presence_mgr.clear_busy = AsyncMock()
+        adapter.presence_mgr.send_typing = AsyncMock()
+        adapter.presence_mgr.stop_typing = AsyncMock()
+        baseline = active_platform_turns(exclude_platform="deck")
+
+        await adapter.send_typing("room-wip-test")
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline + 1)
+
+        await adapter.stop_typing("room-wip-test")
+        await asyncio.sleep(0.01)
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
+
+
 class SignalingFetchNonblockingTests(unittest.IsolatedAsyncioTestCase):
     async def test_long_chat_fetch_does_not_block_ws_receive_loop(self):
         import json
+
         import aiohttp
         from _ncplugin_under_test.signaling import NextcloudSignalingSettings
 
