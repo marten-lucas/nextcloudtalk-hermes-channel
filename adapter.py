@@ -265,6 +265,8 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._active_turn_rooms: Dict[str, int] = {}
         self._room_progress_status: Dict[str, tuple[str, str, str]] = {}
         self._speed_status_room: Optional[str] = None
+        self._room_status_idle_grace_seconds = 3.0
+        self._room_status_idle_tasks: Dict[str, asyncio.Task[None]] = {}
         self._user_status_lock = asyncio.Lock()
 
         # ── Empfangs-Überwachung (Resilience) ──
@@ -367,6 +369,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 self._watchdog_task,
                 *self._room_ws_tasks.values(),
                 *self._event_dispatch_tasks.values(),
+                *self._room_status_idle_tasks.values(),
             )
             if task
         ]
@@ -378,6 +381,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._watchdog_task = None
         self._room_ws_tasks = {}
         self._event_dispatch_tasks = {}
+        self._room_status_idle_tasks.clear()
         self._ws_connected_at.clear()
 
         await self._stop_speed_heartbeat()
@@ -1052,25 +1056,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             media_types=media_types,
         )
 
-        # Principal-Context als lokaler with-Block um die komplette
-        # Agent-Bearbeitung (Token-Reset im finally — kein Identity-Leak,
-        # kein shared state bei parallelen Events). Presence busy für die
-        # Turn-Dauer, zurück auf online danach.
-        await self.mark_turn_started(room_id)
-        try:
-            if principal is not None:
-                with self.identity_mgr.principal_context(principal):
-                    await self.handle_message(msg_event)
-            else:
+        # handle_message() accepts the event and starts the actual agent turn in
+        # a background task. Its return is not the turn-completion boundary; the
+        # Gateway's send_typing/stop_typing lifecycle tracks that background run.
+        if principal is not None:
+            with self.identity_mgr.principal_context(principal):
                 await self.handle_message(msg_event)
-        finally:
-            await self.mark_turn_finished(room_id)
-            # Typing-Indikator spätestens jetzt beenden (safety net — der
-            # Gateway ruft stop_typing normalerweise selbst).
-            try:
-                await self.presence_mgr.stop_typing(room_id)
-            except Exception:
-                pass
+        else:
+            await self.handle_message(msg_event)
 
     async def _get_room_meta(self, room_id: str) -> Optional[Dict[str, Any]]:
         """Raum-Metadaten (Existenz + readOnly) mit TTL-Cache abrufen.
@@ -1535,6 +1528,9 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         """Status-Contract: Fortschritt als Custom-Presence statt Chat-Nachricht."""
         message, icon = self._map_progress_status(status_key, content)
         if message:
+            room_key = str(chat_id)
+            if room_key not in self._active_turn_rooms:
+                await self._activate_room_status(room_key)
             room_meta = await self._get_room_meta(chat_id) or {}
             room_label = str(
                 room_meta.get("displayName") or room_meta.get("name") or ""
@@ -1543,7 +1539,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 room_label = ""
             if room_label and len(room_label) > 32:
                 room_label = room_label[:31].rstrip() + "…"
-            room_key = str(chat_id)
             self._room_progress_status[room_key] = (
                 room_label,
                 message,
@@ -1559,30 +1554,69 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
     # ── Typing-Indikator (Gateway-Contract) ─────────────────────────────
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Typing-Indikator im Talk-Raum. Der Gateway-Loop (_keep_typing) ruft
-        alle ~2 s; der Presence-Manager hält pro Raum einen Refresh-Task (Talk
-        verfällt nach ~15 s). Fehler werden geschluckt — Typing darf den
-        Antwortpfad niemals blockieren."""
+        """Track Gateway's real background-turn heartbeat and signal Talk typing."""
+        room_key = str(chat_id or "").strip()
+        if room_key:
+            await self._activate_room_status(room_key)
         try:
             await self.presence_mgr.send_typing(chat_id)
-            room_key = str(chat_id or "").strip()
-            if room_key and self.presence_mgr.is_busy:
-                self._speed_status_room = room_key
-                self._room_progress_status.setdefault(
-                    room_key,
-                    ("", "Antwortet", "✍️"),
-                )
-                self._ensure_speed_heartbeat()
         except Exception:
             logger.debug("send_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
 
     async def stop_typing(self, chat_id: str) -> None:
-        """Beendet Typing und räumt den globalen KI-Status auf, falls idle."""
+        """End the room's status after Gateway stopped refreshing that turn."""
+        room_key = str(chat_id or "").strip()
         try:
             await self.presence_mgr.stop_typing(chat_id)
         except Exception:
             logger.debug("stop_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
-        finally:
+        if room_key in self._active_turn_rooms:
+            self._schedule_room_status_release(room_key)
+        elif not self.presence_mgr.is_busy:
+            await self._clear_idle_user_status()
+
+    async def _activate_room_status(self, room_key: str) -> None:
+        idle_task = self._room_status_idle_tasks.pop(room_key, None)
+        if idle_task is not None and not idle_task.done():
+            idle_task.cancel()
+            await asyncio.gather(idle_task, return_exceptions=True)
+
+        if room_key not in self._active_turn_rooms:
+            self._active_turn_rooms[room_key] = 1
+            await self.presence_mgr.set_busy()
+        self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
+        self._speed_status_room = room_key
+        async with self._user_status_lock:
+            if self.presence_mgr.is_busy:
+                try:
+                    await self.presence_mgr.set_presence_status("busy")
+                except Exception:
+                    logger.debug("Busy-Presence setzen fehlgeschlagen", exc_info=True)
+        self._ensure_speed_heartbeat()
+
+    def _schedule_room_status_release(self, room_key: str) -> None:
+        previous = self._room_status_idle_tasks.pop(room_key, None)
+        if previous is not None and not previous.done():
+            previous.cancel()
+        task = asyncio.create_task(self._release_room_status_after_idle(room_key))
+        self._room_status_idle_tasks[room_key] = task
+
+    async def _release_room_status_after_idle(self, room_key: str) -> None:
+        try:
+            await asyncio.sleep(self._room_status_idle_grace_seconds)
+        except asyncio.CancelledError:
+            return
+        if self._room_status_idle_tasks.get(room_key) is not asyncio.current_task():
+            return
+        self._room_status_idle_tasks.pop(room_key, None)
+        active_count = self._active_turn_rooms.pop(room_key, 0)
+        self._room_progress_status.pop(room_key, None)
+        self.presence_mgr.set_status_text(room_key, None)
+        if self._speed_status_room == room_key:
+            self._speed_status_room = next(reversed(self._active_turn_rooms), None)
+        for _ in range(active_count):
+            await self.presence_mgr.clear_busy()
+        if not self.presence_mgr.is_busy:
             await self._clear_idle_user_status()
 
     async def mark_turn_started(self, chat_id: Optional[str] = None) -> None:
@@ -1633,6 +1667,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             await self._stop_speed_heartbeat()
             if self.presence_mgr.is_busy:
                 return
+            idle_tasks = [
+                task for task in self._room_status_idle_tasks.values()
+                if task is not asyncio.current_task() and not task.done()
+            ]
+            for task in idle_tasks:
+                task.cancel()
+            if idle_tasks:
+                await asyncio.gather(*idle_tasks, return_exceptions=True)
+            self._room_status_idle_tasks.clear()
             self._active_turn_rooms.clear()
             for room_key in self._room_progress_status:
                 self.presence_mgr.set_status_text(room_key, None)

@@ -335,17 +335,41 @@ class PersistentTypingWebSocketTests(unittest.IsolatedAsyncioTestCase):
 class TypingContractTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.adapter = make_adapter()
+        self.adapter._room_status_idle_grace_seconds = 0.01
 
-    async def test_send_typing_emits_signaling_event(self):
+    async def asyncTearDown(self):
+        for room_id in list(self.adapter._active_turn_rooms):
+            await self.adapter.stop_typing(room_id)
+        await asyncio.sleep(0.02)
+
+    async def test_send_typing_emits_signaling_and_sets_busy_presence(self):
         await self.adapter.send_typing("room1")
-        # Sofortiges Signaling-Event gefeuert (startedTyping)
         self.assertIn(("room1", True), self.adapter.mock_signaling.typing_events)
+        self.assertTrue(self.adapter.presence_mgr.is_busy)
+        self.assertEqual(self.adapter.presence_updates[-1], "busy")
         await self.adapter.stop_typing("room1")
+        await asyncio.sleep(0.02)
+        self.assertFalse(self.adapter.presence_mgr.is_busy)
+        self.assertEqual(self.adapter.presence_updates[-1], "online")
 
     async def test_stop_typing_emits_stopped_event(self):
         await self.adapter.send_typing("room1")
         await self.adapter.stop_typing("room1")
         self.assertIn(("room1", False), self.adapter.mock_signaling.typing_events)
+
+    async def test_new_typing_tick_cancels_pending_status_release(self):
+        await self.adapter.send_typing("room1")
+        await self.adapter.stop_typing("room1")
+        await asyncio.sleep(0.002)
+
+        await self.adapter.send_typing("room1")
+        await asyncio.sleep(0.02)
+
+        self.assertTrue(self.adapter.presence_mgr.is_busy)
+        self.assertIn("room1", self.adapter._active_turn_rooms)
+        await self.adapter.stop_typing("room1")
+        await asyncio.sleep(0.02)
+        self.assertFalse(self.adapter.presence_mgr.is_busy)
 
     async def test_send_typing_starts_renew_task(self):
         await self.adapter.send_typing("room1")
@@ -544,29 +568,34 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(mgr.is_busy)
 
     async def test_last_turn_clears_global_custom_status(self):
-        await self.adapter.mark_turn_started()
-        await self.adapter.mark_turn_started()
+        await self.adapter.mark_turn_started("room1")
+        await self.adapter.mark_turn_started("room2")
         await self.adapter.send_or_update_status("room1", "_thinking", "")
 
-        await self.adapter.mark_turn_finished()
+        await self.adapter.mark_turn_finished("room1")
         self.assertTrue(self.adapter.presence_mgr.is_busy)
         self.assertEqual(self.adapter.custom_status_clears, [])
 
-        await self.adapter.mark_turn_finished()
+        await self.adapter.mark_turn_finished("room2")
         self.assertFalse(self.adapter.presence_mgr.is_busy)
         self.assertEqual(self.adapter.custom_status_clears, [True])
         self.assertEqual(self.adapter.presence_updates[-1], "online")
 
     async def test_stop_typing_clears_custom_status_without_turn_hooks(self):
+        self.adapter._room_status_idle_grace_seconds = 0.01
         await self.adapter.send_or_update_status("room1", "_generating", "")
+        self.assertTrue(self.adapter.presence_mgr.is_busy)
 
         await self.adapter.stop_typing("room1")
+        await asyncio.sleep(0.02)
 
+        self.assertFalse(self.adapter.presence_mgr.is_busy)
         self.assertEqual(self.adapter.custom_status_clears, [True])
         self.assertEqual(self.adapter.presence_updates[-1], "online")
 
-    async def test_handle_incoming_event_sets_busy(self):
+    async def test_inbound_handoff_does_not_end_gateway_typing_lifecycle(self):
         adapter = make_adapter()
+        adapter._room_status_idle_grace_seconds = 0.01
         adapter.mock_participants["room-busy"] = 2
         adapter.identity_mgr.get_user_groups = AsyncMock(return_value=[])
 
@@ -574,6 +603,7 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         original_handle = adapter.handle_message
 
         async def spy_handle(event):
+            await adapter.send_typing("room-busy")
             states.append(adapter.presence_mgr.is_busy)
             await original_handle(event)
 
@@ -581,8 +611,11 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         await adapter.handle_incoming_event(
             {"room_id": "room-busy", "id": "m-busy-1", "actorId": "vorstand", "message": "Test"}
         )
-        # Während handle_message lief, war busy aktiv
         self.assertEqual(states, [True])
+        self.assertTrue(adapter.presence_mgr.is_busy)
+
+        await adapter.stop_typing("room-busy")
+        await asyncio.sleep(0.02)
         self.assertFalse(adapter.presence_mgr.is_busy)
 
 

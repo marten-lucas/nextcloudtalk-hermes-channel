@@ -218,10 +218,14 @@ Ollama sidecar unless Talk-specific values are configured.
 
 ### User Status
 
-During active turns Talk sets the Nextcloud presence to `busy` and restores it
-to `online` after the last concurrent turn ends. When live speed is enabled,
-the status refreshes every three seconds with the active room, phase, prompt
-progress, and Ollama token rate (generation `tg` or prompt `prompt_tps`).
+Talk follows the Gateway's background typing lifecycle: `send_typing` marks a
+room active and the matching `stop_typing` releases it after a short quiet grace.
+It does not treat the inbound `handle_message` handoff as turn completion, since
+Hermes dispatches the agent run in a background task. The Nextcloud presence is
+`busy` while any room remains active and returns to `online` after the last one
+finishes. When live speed is enabled, the status refreshes every three seconds
+with the active room, phase, prompt progress, and Ollama token rate (generation
+`tg` or prompt `prompt_tps`).
 
 ### Room Behavior
 
