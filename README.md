@@ -21,7 +21,8 @@ Standalone Hermes platform plugin for **Nextcloud Talk** integration.
   the transcript as normal text into the conversation.
 - ✅ Sender identity propagation to Hermes and downstream MCP tools (`X-On-Behalf-Of`, `X-User-Groups`)
 - ✅ Human-in-the-Loop (HITL) approvals via message reactions
-- ✅ Custom presence and status signaling
+- ✅ Custom presence and status signaling, including `busy` during active turns
+- ✅ Optional live Ollama speed (`t/s`) in the global Talk user status
 
 ## Connection health and reconnects
 
@@ -79,6 +80,11 @@ export NEXTCLOUD_BOT_HANDLE="@hermes"
 export NEXTCLOUD_CONTEXT_MESSAGE_LIMIT="20"
 export NEXTCLOUD_REQUIRE_MENTION_IN_GROUPS="true"
 ```
+
+Talk also reuses `NEXTCLOUD_DECK_SPEED_ENABLED` and `NEXTCLOUD_DECK_SPEED_URL` when
+its own `NEXTCLOUD_TALK_SPEED_ENABLED` / `NEXTCLOUD_TALK_SPEED_URL` values are
+unset. This keeps the Deck and Talk user-status speed source aligned; Talk-specific
+values can override the Deck defaults.
 
 See [Configuration Reference](#configuration-reference) for complete list.
 
@@ -203,6 +209,19 @@ All other messages sent as normal bot responses:
 | `NEXTCLOUD_ATTACHMENT_TMP_DIR` | (system temp) | Directory for temporary attachment downloads |
 | `NEXTCLOUD_HITL_REQUIRE_REQUESTER` | `true` | Only original requester can approve/reject reactions |
 | `NEXTCLOUD_HOME_CHANNEL` | (none) | Default room ID for cron/scheduled delivery |
+| `NEXTCLOUD_TALK_SPEED_ENABLED` | Deck setting | Enable live Ollama speed in the global Talk user status |
+| `NEXTCLOUD_TALK_SPEED_URL` | Deck speed URL | Ollama sidecar endpoint returning `/speed` JSON |
+
+The speed settings default to `NEXTCLOUD_DECK_SPEED_ENABLED` and
+`NEXTCLOUD_DECK_SPEED_URL`, respectively, so both adapters use the same
+Ollama sidecar unless Talk-specific values are configured.
+
+### User Status
+
+During active turns Talk sets the Nextcloud presence to `busy` and restores it
+to `online` after the last concurrent turn ends. When live speed is enabled,
+the status refreshes every three seconds with the active room, phase, prompt
+progress, and Ollama token rate (generation `tg` or prompt `prompt_tps`).
 
 ### Room Behavior
 

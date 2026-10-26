@@ -1,12 +1,12 @@
 name: nextcloud-talk-platform
 label: Nextcloud Talk
 kind: platform
-version: 0.3.1
+version: 0.4.0
 description: >
   Nextcloud Talk gateway adapter for Hermes Agent.
   Connects as a regular Nextcloud user, listens via WebSocket (HPB) with OCS polling fallback,
-  supports mention gating, on-demand context fetch, replyTo messaging, attachment download stubs,
-  identity passthrough, active presence/typing signaling, and HITL approvals via reactions.
+  supports mention gating, on-demand context fetch, replyTo messaging, attachment downloads,
+  identity passthrough, live busy/typing status with optional Ollama speed, and HITL approvals.
 author: Local Development
 entrypoint: adapter.py
 python_dependencies:
@@ -56,4 +56,12 @@ optional_env:
   - name: NEXTCLOUD_HOME_CHANNEL
     description: "Default room ID for cron/home delivery"
     prompt: "Home room ID"
+    password: false
+  - name: NEXTCLOUD_TALK_SPEED_ENABLED
+    description: "Show live Ollama token speed in the Talk user status; defaults to the Deck speed setting"
+    prompt: "Enable live Ollama speed in Talk status"
+    password: false
+  - name: NEXTCLOUD_TALK_SPEED_URL
+    description: "Ollama speed-sidecar URL; defaults to NEXTCLOUD_DECK_SPEED_URL"
+    prompt: "Ollama speed sidecar URL for Talk"
     password: false

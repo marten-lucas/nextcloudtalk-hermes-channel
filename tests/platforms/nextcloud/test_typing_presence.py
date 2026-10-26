@@ -10,7 +10,7 @@ Verträge:
 """
 import asyncio
 import unittest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
     TestableNextcloudTalkPlatform,
@@ -382,6 +382,144 @@ class TypingContractTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter.send_typing("")
         await self.adapter.stop_typing("")
         self.assertEqual(self.adapter.presence_mgr._typing_tasks, {})
+
+
+class SpeedStatusContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_deck_speed_configuration_is_inherited_by_talk(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "NEXTCLOUD_DECK_SPEED_ENABLED": "true",
+                "NEXTCLOUD_DECK_SPEED_URL": "https://speed.example/speed",
+            },
+            clear=True,
+        ):
+            adapter = make_adapter()
+
+        self.assertTrue(adapter.runtime.speed_enabled)
+        self.assertEqual(
+            adapter.runtime.speed_url,
+            "https://speed.example/speed",
+        )
+
+    def test_talk_speed_setting_can_override_deck_default(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "NEXTCLOUD_DECK_SPEED_ENABLED": "true",
+                "NEXTCLOUD_DECK_SPEED_URL": "https://deck.example/speed",
+                "NEXTCLOUD_TALK_SPEED_ENABLED": "false",
+                "NEXTCLOUD_TALK_SPEED_URL": "https://talk.example/speed",
+            },
+            clear=True,
+        ):
+            adapter = make_adapter()
+
+        self.assertFalse(adapter.runtime.speed_enabled)
+        self.assertEqual(adapter.runtime.speed_url, "https://talk.example/speed")
+
+    async def test_fetch_speed_reads_json_from_configured_sidecar(self):
+        adapter = make_adapter()
+        adapter.runtime.speed_url = "https://speed.example/speed"
+        requests = []
+
+        class Response:
+            status = 200
+
+            async def json(self, *, content_type=None):
+                return {"phase": "generate", "tg": 11.87}
+
+        class ResponseContext:
+            async def __aenter__(self):
+                return Response()
+
+            async def __aexit__(self, *_args):
+                return False
+
+        class Session:
+            closed = False
+
+            def get(self, url, *, timeout):
+                requests.append((url, timeout.total))
+                return ResponseContext()
+
+        adapter._speed_session = Session()
+
+        speed = await adapter._fetch_speed()
+
+        self.assertEqual(speed, {"phase": "generate", "tg": 11.87})
+        self.assertEqual(requests, [("https://speed.example/speed", 0.4)])
+        adapter._speed_session = None
+
+    def test_speed_suffix_formats_generation_and_prompt_phases(self):
+        adapter = make_adapter()
+
+        self.assertEqual(
+            adapter._speed_suffix({"phase": "generate", "tg": 11.87}),
+            "11.9 t/s",
+        )
+        self.assertEqual(
+            adapter._speed_suffix(
+                {
+                    "phase": "prompt",
+                    "prompt_progress": 0.42,
+                    "prompt_tps": 100.41,
+                }
+            ),
+            "Kontext 42% · ⏱ 100 t/s",
+        )
+        self.assertEqual(adapter._speed_suffix({"phase": "idle"}), "")
+
+    async def test_shared_speed_heartbeat_sets_busy_and_live_status(self):
+        adapter = make_adapter()
+        adapter.runtime.speed_enabled = True
+        adapter.runtime.speed_url = "https://speed.example/speed"
+        adapter._room_progress_status["room-speed"] = (
+            "Team Talk",
+            "Antwortet",
+            "✍️",
+        )
+        speed_status_set = asyncio.Event()
+
+        async def fetch_speed():
+            return {"phase": "generate", "tg": 11.87}
+
+        async def record_custom_status(message, icon=None):
+            adapter.custom_status_updates.append((message, icon))
+            if message == "Team Talk · Antwortet ⚡ 11.9 t/s":
+                speed_status_set.set()
+
+        adapter._fetch_speed = fetch_speed
+        adapter._set_custom_status_message = record_custom_status
+
+        await adapter.mark_turn_started("room-speed")
+        await asyncio.wait_for(speed_status_set.wait(), timeout=1.0)
+
+        self.assertIn("busy", adapter.presence_updates)
+        self.assertEqual(
+            adapter.custom_status_updates[-1],
+            ("Team Talk · Antwortet ⚡ 11.9 t/s", "✍️"),
+        )
+        await adapter.mark_turn_finished("room-speed")
+        self.assertEqual(adapter.presence_updates[-1], "online")
+        self.assertIsNone(adapter._speed_heartbeat_task)
+
+    async def test_parallel_turns_keep_busy_until_the_last_turn_finishes(self):
+        adapter = make_adapter()
+
+        await adapter.mark_turn_started("room-one")
+        await adapter.mark_turn_started("room-two")
+        await adapter.mark_turn_finished("room-one")
+
+        self.assertTrue(adapter.presence_mgr.is_busy)
+        self.assertNotEqual(adapter.presence_updates[-1], "online")
+        self.assertEqual(adapter.custom_status_clears, [])
+
+        await adapter.mark_turn_finished("room-two")
+
+        self.assertFalse(adapter.presence_mgr.is_busy)
+        self.assertEqual(adapter.presence_updates[-1], "online")
+        self.assertEqual(adapter.custom_status_clears, [True])
 
 
 class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):

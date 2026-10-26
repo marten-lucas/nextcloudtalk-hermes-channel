@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import aiohttp
+
 from .attachments import NextcloudAttachmentManager
 from .client import NextcloudOCSException, NextcloudTalkClient
 from .hitl import HITLManager
@@ -96,6 +98,8 @@ class NextcloudRuntimeConfig:
     allowed_rooms: set[str] = field(default_factory=set)
     attachment_tmp_dir: str = ""
     hitl_require_requester: bool = True
+    speed_enabled: bool = False
+    speed_url: str = ""
 
 
 class NextcloudTalkPlatform(BasePlatformAdapter):
@@ -194,6 +198,12 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 or os.getenv("NEXTCLOUD_HITL_REQUIRE_REQUESTER", "true")
             ).lower()
             in {"1", "true", "yes"},
+            speed_enabled=self._resolve_speed_enabled(extra),
+            speed_url=str(
+                extra.get("speed_url")
+                or os.getenv("NEXTCLOUD_TALK_SPEED_URL")
+                or os.getenv("NEXTCLOUD_DECK_SPEED_URL", "")
+            ).strip(),
         )
 
         self.client = NextcloudTalkClient(
@@ -247,6 +257,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._room_meta_cache_ts: Dict[str, float] = {}
         self._room_meta_ttl_seconds: float = 300.0
 
+        self._speed_session: Optional[aiohttp.ClientSession] = None
+        self._last_speed: Optional[Dict[str, Any]] = None
+        self._speed_heartbeat_interval_seconds = 3.0
+        self._speed_heartbeat_task: Optional[asyncio.Task[None]] = None
+        self._speed_heartbeat_stop: Optional[asyncio.Event] = None
+        self._active_turn_rooms: Dict[str, int] = {}
+        self._room_progress_status: Dict[str, tuple[str, str, str]] = {}
+        self._speed_status_room: Optional[str] = None
+        self._user_status_lock = asyncio.Lock()
+
         # ── Empfangs-Überwachung (Resilience) ──
         # Anwendungsaktivität und Transport-/Poll-Aktivität getrennt halten.
         self._last_rx: Dict[str, float] = {}
@@ -267,6 +287,15 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._ws_reconnect_stable_seconds = 60.0
         self._ws_reconnect_jitter = 0.2
 
+
+    @staticmethod
+    def _resolve_speed_enabled(extra: Dict[str, Any]) -> bool:
+        configured = extra.get("speed_enabled")
+        if configured is None:
+            configured = os.getenv("NEXTCLOUD_TALK_SPEED_ENABLED")
+        if configured is None:
+            configured = os.getenv("NEXTCLOUD_DECK_SPEED_ENABLED", "false")
+        return str(configured).strip().lower() in {"1", "true", "yes", "on"}
 
     @property
     def is_connected(self) -> bool:
@@ -351,10 +380,20 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._event_dispatch_tasks = {}
         self._ws_connected_at.clear()
 
-        await self.presence_mgr.set_presence_status(
-            "offline"
-        )
+        await self._stop_speed_heartbeat()
+        if self._speed_session and not self._speed_session.closed:
+            await self._speed_session.close()
+        self._speed_session = None
+        self._active_turn_rooms.clear()
+        for room_key in self._room_progress_status:
+            self.presence_mgr.set_status_text(room_key, None)
+        self._room_progress_status.clear()
+        self._speed_status_room = None
+        while self.presence_mgr.is_busy:
+            await self.presence_mgr.clear_busy()
 
+        await self.presence_mgr.set_presence_status("offline")
+        await self.presence_mgr.clear_custom_status_message(force=True)
         await self.client.close()
 
         self._mark_disconnected()
@@ -1017,7 +1056,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         # Agent-Bearbeitung (Token-Reset im finally — kein Identity-Leak,
         # kein shared state bei parallelen Events). Presence busy für die
         # Turn-Dauer, zurück auf online danach.
-        await self.mark_turn_started()
+        await self.mark_turn_started(room_id)
         try:
             if principal is not None:
                 with self.identity_mgr.principal_context(principal):
@@ -1025,7 +1064,7 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             else:
                 await self.handle_message(msg_event)
         finally:
-            await self.mark_turn_finished()
+            await self.mark_turn_finished(room_id)
             # Typing-Indikator spätestens jetzt beenden (safety net — der
             # Gateway ruft stop_typing normalerweise selbst).
             try:
@@ -1500,12 +1539,21 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             room_label = str(
                 room_meta.get("displayName") or room_meta.get("name") or ""
             ).strip()
-            if room_label and room_label != str(chat_id):
-                if len(room_label) > 32:
-                    room_label = room_label[:31].rstrip() + "…"
-                message = f"{room_label} · {message}"
-            self.presence_mgr.set_status_text(chat_id, message)
-            await self.presence_mgr.set_custom_status_message(message, icon)
+            if room_label == str(chat_id):
+                room_label = ""
+            if room_label and len(room_label) > 32:
+                room_label = room_label[:31].rstrip() + "…"
+            room_key = str(chat_id)
+            self._room_progress_status[room_key] = (
+                room_label,
+                message,
+                icon or "💬",
+            )
+            if room_key in self._active_turn_rooms:
+                self._speed_status_room = room_key
+            display_message = f"{room_label} · {message}" if room_label else message
+            self.presence_mgr.set_status_text(chat_id, display_message)
+            await self.presence_mgr.set_custom_status_message(display_message, icon)
         return SendResult(success=True)
 
     # ── Typing-Indikator (Gateway-Contract) ─────────────────────────────
@@ -1517,6 +1565,14 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         Antwortpfad niemals blockieren."""
         try:
             await self.presence_mgr.send_typing(chat_id)
+            room_key = str(chat_id or "").strip()
+            if room_key and self.presence_mgr.is_busy:
+                self._speed_status_room = room_key
+                self._room_progress_status.setdefault(
+                    room_key,
+                    ("", "Antwortet", "✍️"),
+                )
+                self._ensure_speed_heartbeat()
         except Exception:
             logger.debug("send_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
 
@@ -1529,15 +1585,40 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         finally:
             await self._clear_idle_user_status()
 
-    async def mark_turn_started(self) -> None:
-        """Presence-Marker: ein Turn ist aktiv (Referenzgezählt)."""
+    async def mark_turn_started(self, chat_id: Optional[str] = None) -> None:
+        """Mark an active turn and start the shared live-status heartbeat."""
         try:
             await self.presence_mgr.set_busy()
         except Exception:
-            logger.debug("set_busy fehlgeschlagen", exc_info=True)
+            logger.debug("Busy-Presence-Referenz setzen fehlgeschlagen", exc_info=True)
+        room_key = str(chat_id or "").strip()
+        if room_key:
+            self._active_turn_rooms[room_key] = self._active_turn_rooms.get(room_key, 0) + 1
+            self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
+            self._speed_status_room = room_key
+        async with self._user_status_lock:
+            if self.presence_mgr.is_busy:
+                try:
+                    await self.presence_mgr.set_presence_status("busy")
+                except Exception:
+                    logger.debug("Busy-Presence setzen fehlgeschlagen", exc_info=True)
+        self._ensure_speed_heartbeat()
 
-    async def mark_turn_finished(self) -> None:
-        """Turn beendet — Status des KI-Users wie bei Deck zurücksetzen."""
+    async def mark_turn_finished(self, chat_id: Optional[str] = None) -> None:
+        """Release one turn; retain busy/status while any turn remains active."""
+        room_key = str(chat_id or "").strip()
+        if room_key:
+            active_count = self._active_turn_rooms.get(room_key, 0)
+            if active_count <= 1:
+                self._active_turn_rooms.pop(room_key, None)
+                self._room_progress_status.pop(room_key, None)
+                self.presence_mgr.set_status_text(room_key, None)
+            else:
+                self._active_turn_rooms[room_key] = active_count - 1
+            if self._speed_status_room == room_key:
+                self._speed_status_room = next(
+                    reversed(self._active_turn_rooms), None
+                )
         try:
             await self.presence_mgr.clear_busy()
         except Exception:
@@ -1545,14 +1626,151 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         await self._clear_idle_user_status()
 
     async def _clear_idle_user_status(self) -> None:
-        """Custom-Status nur löschen, wenn kein anderer Raum mehr aktiv ist."""
-        if self.presence_mgr.is_busy:
+        """Clear the global status only after the final concurrent turn ends."""
+        async with self._user_status_lock:
+            if self.presence_mgr.is_busy:
+                return
+            await self._stop_speed_heartbeat()
+            if self.presence_mgr.is_busy:
+                return
+            self._active_turn_rooms.clear()
+            for room_key in self._room_progress_status:
+                self.presence_mgr.set_status_text(room_key, None)
+            self._room_progress_status.clear()
+            self._speed_status_room = None
+            try:
+                await self.presence_mgr.clear_custom_status_message(force=True)
+                if self.presence_mgr.is_busy:
+                    await self.presence_mgr.set_presence_status("busy")
+                    return
+                await self.presence_mgr.set_presence_status("online")
+            except Exception:
+                logger.debug("Talk-User-Status beim Turn-Ende nicht bereinigt", exc_info=True)
+
+    def _ensure_speed_heartbeat(self) -> None:
+        if not self.runtime.speed_enabled or not self.runtime.speed_url:
             return
+        if self._speed_heartbeat_task and not self._speed_heartbeat_task.done():
+            return
+        stop_event = asyncio.Event()
+        self._speed_heartbeat_stop = stop_event
+        self._speed_heartbeat_task = asyncio.create_task(
+            self._run_speed_heartbeat(stop_event)
+        )
+
+    async def _run_speed_heartbeat(self, stop_event: asyncio.Event) -> None:
         try:
-            await self.presence_mgr.clear_custom_status_message(force=True)
-            await self.presence_mgr.set_presence_status("online")
+            while not stop_event.is_set() and self.presence_mgr.is_busy:
+                room_key = self._speed_status_room
+                if self._active_turn_rooms and room_key not in self._active_turn_rooms:
+                    room_key = next(reversed(self._active_turn_rooms), None)
+                if room_key:
+                    speed = await self._fetch_speed()
+                    if stop_event.is_set():
+                        return
+                    if speed:
+                        await self._update_speed_status(room_key, speed)
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(),
+                        timeout=self._speed_heartbeat_interval_seconds,
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.debug("Talk-User-Status beim Turn-Ende nicht bereinigt", exc_info=True)
+            logger.debug("Talk-Speed-Heartbeat fehlgeschlagen", exc_info=True)
+
+    async def _stop_speed_heartbeat(self) -> None:
+        stop_event = self._speed_heartbeat_stop
+        task = self._speed_heartbeat_task
+        if stop_event is not None:
+            stop_event.set()
+        if task is not None and task is not asyncio.current_task():
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except asyncio.TimeoutError:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            except asyncio.CancelledError:
+                pass
+        self._speed_heartbeat_task = None
+        self._speed_heartbeat_stop = None
+        if self.presence_mgr.is_busy and not self._stop_event.is_set():
+            self._ensure_speed_heartbeat()
+
+    async def _fetch_speed(self) -> Optional[Dict[str, Any]]:
+        if not self.runtime.speed_url:
+            return None
+        try:
+            if self._speed_session is None or self._speed_session.closed:
+                self._speed_session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=0.4)
+                )
+            async with self._speed_session.get(
+                self.runtime.speed_url,
+                timeout=aiohttp.ClientTimeout(total=0.4),
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json(content_type=None)
+                self._last_speed = payload if isinstance(payload, dict) else None
+                return self._last_speed
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            return None
+
+    async def _update_speed_status(
+        self,
+        room_key: str,
+        speed: Dict[str, Any],
+    ) -> None:
+        room_label, previous_message, previous_icon = self._room_progress_status.get(
+            room_key,
+            ("", "Antwortet", "✍️"),
+        )
+        if not room_label:
+            room_meta = await self._get_room_meta(room_key) or {}
+            room_label = str(
+                room_meta.get("displayName") or room_meta.get("name") or ""
+            ).strip()
+            if room_label == room_key:
+                room_label = ""
+            if len(room_label) > 32:
+                room_label = room_label[:31].rstrip() + "…"
+            self._room_progress_status[room_key] = (
+                room_label,
+                previous_message,
+                previous_icon,
+            )
+        phase = str(speed.get("phase", "idle")).lower()
+        if phase == "generate":
+            action, icon = "Antwortet", "✍️"
+        else:
+            action, icon = "Liest Kontext", "📖"
+        prefix = f"{room_label} · {action}" if room_label else action
+        suffix = self._speed_suffix(speed)
+        message = f"{prefix} ⚡ {suffix}" if suffix else prefix
+        await self.presence_mgr.set_custom_status_message(message, icon)
+
+    @staticmethod
+    def _speed_suffix(speed: Dict[str, Any]) -> str:
+        phase = str(speed.get("phase", "idle")).lower()
+        if phase == "generate":
+            tokens_per_second = speed.get("tg")
+            if isinstance(tokens_per_second, (int, float)) and tokens_per_second > 0:
+                return f"{tokens_per_second:.1f} t/s"
+            return ""
+        if phase == "prompt":
+            parts = []
+            progress = speed.get("prompt_progress")
+            prompt_tps = speed.get("prompt_tps")
+            if isinstance(progress, (int, float)) and progress > 0:
+                parts.append(f"Kontext {int(progress * 100)}%")
+            if isinstance(prompt_tps, (int, float)) and prompt_tps > 0:
+                parts.append(f"⏱ {prompt_tps:.0f} t/s")
+            return " · ".join(parts)
+        return ""
 
     @staticmethod
     def _map_progress_status(status_key: str, content: str) -> tuple[Optional[str], Optional[str]]:
