@@ -22,7 +22,7 @@ if "adapter" not in sys.modules:
     sys.modules["adapter"] = sys.modules["_ncplugin_under_test.adapter"]
 
 import adapter as nextcloud_adapter_module
-from adapter import NextcloudTalkPlatform, MessageType
+from adapter import MessageType, NextcloudTalkPlatform
 
 
 class _MockTalkClient:
@@ -158,10 +158,12 @@ class TestableNextcloudTalkPlatform(NextcloudTalkPlatform):
         self.presence_mgr.signaling_mgr = self.mock_signaling
 
         class _HookedPresenceManager(type(self.presence_mgr)):
-            async def set_presence_status(state_self, state):
+            async def set_presence_status(state_self, state, *, force=False):
+                del force
                 await adapter._set_presence_status(state)
 
-            async def set_custom_status_message(state_self, message, status_icon=None):
+            async def set_custom_status_message(state_self, message, status_icon=None, *, force=False):
+                del force
                 await adapter._set_custom_status_message(message, status_icon)
 
             async def clear_custom_status_message(state_self, *, force=False):

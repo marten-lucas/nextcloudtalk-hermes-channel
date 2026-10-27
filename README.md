@@ -86,6 +86,12 @@ its own `NEXTCLOUD_TALK_SPEED_ENABLED` / `NEXTCLOUD_TALK_SPEED_URL` values are
 unset. This keeps the Deck and Talk user-status speed source aligned; Talk-specific
 values can override the Deck defaults.
 
+When the Deck plugin is enabled in the same Gateway process,
+`NEXTCLOUD_DECK_MAX_IN_PROGRESS` is the shared model-turn concurrency limit for
+both Deck and Talk. Talk acquires/releases a slot at Hermes' real background
+processing hooks; typing refreshes do not own turn state. `0` (the default)
+leaves model concurrency unlimited.
+
 See [Configuration Reference](#configuration-reference) for complete list.
 
 ### 2. Installation

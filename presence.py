@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Dict, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -22,23 +22,23 @@ class NextcloudPresenceManager:
     def __init__(self, client: Any, signaling_mgr: Any = None):
         self.client = client
         self.signaling_mgr = signaling_mgr
-        self._current_presence_state: Optional[str] = None
-        self._current_custom_status: Optional[tuple[Optional[str], str]] = None
-        self._status_text: Dict[str, str] = {}
+        self._current_presence_state: str | None = None
+        self._current_custom_status: tuple[str | None, str] | None = None
+        self._status_text: dict[str, str] = {}
         # Typing-Renew-Tasks pro Raum (send_typing/stop_typing Contract).
-        self._typing_tasks: Dict[str, asyncio.Task] = {}
+        self._typing_tasks: dict[str, asyncio.Task] = {}
         # Referenzzähler für aktive Turns — Presence busy <-> online.
         self._busy_refs: int = 0
 
-    def set_status_text(self, chat_id: str, text: Optional[str]) -> None:
+    def set_status_text(self, chat_id: str, text: str | None) -> None:
         if text:
             self._status_text[str(chat_id)] = text
         else:
             self._status_text.pop(str(chat_id), None)
 
-    async def set_presence_status(self, state: str) -> None:
+    async def set_presence_status(self, state: str, *, force: bool = False) -> None:
         normalized = str(state or "").strip().lower()
-        if normalized == self._current_presence_state:
+        if not force and normalized == self._current_presence_state:
             return
         await self.client.ocs_put_core(
             "apps/user_status/api/v1/user_status/status",
@@ -110,13 +110,19 @@ class NextcloudPresenceManager:
         except asyncio.CancelledError:
             raise
 
-    async def set_custom_status_message(self, message: str, status_icon: Optional[str] = None) -> None:
+    async def set_custom_status_message(
+        self,
+        message: str,
+        status_icon: str | None = None,
+        *,
+        force: bool = False,
+    ) -> None:
         normalized_message = " ".join(str(message or "").split()).strip()
         new_state = (status_icon, normalized_message)
-        if not normalized_message or new_state == self._current_custom_status:
+        if not normalized_message or (not force and new_state == self._current_custom_status):
             return
 
-        payload: Dict[str, Any] = {"message": normalized_message[:140]}
+        payload: dict[str, Any] = {"message": normalized_message[:140]}
         if status_icon:
             payload["statusIcon"] = status_icon
 

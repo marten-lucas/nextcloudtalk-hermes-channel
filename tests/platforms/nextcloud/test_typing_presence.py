@@ -13,9 +13,16 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from _ncplugin_under_test.client import NextcloudTalkClient
-from _ncplugin_under_test.platform_wip import active_platform_turns
+from _ncplugin_under_test.platform_wip import (
+    active_platform_turns,
+    register_presence_turn,
+    set_presence_turn_status,
+    unregister_presence_turn,
+)
 from _ncplugin_under_test.presence import NextcloudPresenceManager
 from _ncplugin_under_test.signaling import NextcloudSignalingManager
+
+import adapter as nextcloud_adapter_module
 
 from .test_adapter_contracts import (  # noqa: F401  (Bootstrap-Nebeneffekt)
     TestableNextcloudTalkPlatform,
@@ -167,23 +174,54 @@ class UserStatusOcsContractTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SharedPlatformWipTests(unittest.IsolatedAsyncioTestCase):
-    async def test_talk_typing_lifecycle_is_visible_to_deck_wip(self):
+    async def test_processing_hooks_acquire_and_release_event_token_once(self):
         adapter = make_adapter()
-        adapter._room_status_idle_grace_seconds = 0
-        adapter._ensure_speed_heartbeat = Mock()
-        adapter._clear_idle_user_status = AsyncMock()
-        adapter.presence_mgr.set_presence_status = AsyncMock()
-        adapter.presence_mgr.set_busy = AsyncMock()
-        adapter.presence_mgr.clear_busy = AsyncMock()
+        event = {"chat_id": "room-wip-test"}
+        baseline = active_platform_turns(exclude_platform="deck")
+
+        await adapter.on_processing_start(event)
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline + 1)
+        self.assertTrue(adapter.presence_mgr.is_busy)
+        self.assertEqual(adapter._active_turn_rooms["room-wip-test"], 1)
+
+        await adapter.on_processing_complete(event, "CANCELLED")
+        await adapter.on_processing_complete(event, "CANCELLED")
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
+        self.assertFalse(adapter.presence_mgr.is_busy)
+        self.assertEqual(adapter._processing_event_fallback, {})
+
+    async def test_acquire_error_propagates_and_does_not_leave_event_token(self):
+        adapter = make_adapter()
+        event = {"chat_id": "room-acquire-error"}
+        baseline = active_platform_turns(exclude_platform="deck")
+        with patch.object(
+            nextcloud_adapter_module,
+            "acquire_platform_turn",
+            AsyncMock(side_effect=RuntimeError("acquire failed")),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "acquire failed"):
+                await adapter.on_processing_start(event)
+
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
+        self.assertEqual(adapter._processing_event_fallback, {})
+        self.assertFalse(adapter.presence_mgr.is_busy)
+
+    async def test_start_is_idempotent_and_typing_does_not_change_wip(self):
+        adapter = make_adapter()
         adapter.presence_mgr.send_typing = AsyncMock()
         adapter.presence_mgr.stop_typing = AsyncMock()
+        event = {"session_key": "session-wip-test", "room_id": "room-wip-test"}
         baseline = active_platform_turns(exclude_platform="deck")
 
         await adapter.send_typing("room-wip-test")
+        await adapter.on_processing_start(event)
+        await adapter.on_processing_start(event)
         self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline + 1)
 
         await adapter.stop_typing("room-wip-test")
-        await asyncio.sleep(0.01)
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline + 1)
+        self.assertTrue(adapter.presence_mgr.is_busy)
+        await adapter.on_processing_complete(event, "SUCCESS")
         self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
 
 
@@ -366,34 +404,29 @@ class TypingContractTests(unittest.IsolatedAsyncioTestCase):
             await self.adapter.stop_typing(room_id)
         await asyncio.sleep(0.02)
 
-    async def test_send_typing_emits_signaling_and_sets_busy_presence(self):
+    async def test_send_typing_only_emits_signaling(self):
+        baseline = active_platform_turns(exclude_platform="deck")
         await self.adapter.send_typing("room1")
         self.assertIn(("room1", True), self.adapter.mock_signaling.typing_events)
-        self.assertTrue(self.adapter.presence_mgr.is_busy)
-        self.assertEqual(self.adapter.presence_updates[-1], "busy")
-        await self.adapter.stop_typing("room1")
-        await asyncio.sleep(0.02)
         self.assertFalse(self.adapter.presence_mgr.is_busy)
-        self.assertEqual(self.adapter.presence_updates[-1], "online")
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
+        await self.adapter.stop_typing("room1")
+        self.assertFalse(self.adapter.presence_mgr.is_busy)
+        self.assertEqual(active_platform_turns(exclude_platform="deck"), baseline)
 
     async def test_stop_typing_emits_stopped_event(self):
         await self.adapter.send_typing("room1")
         await self.adapter.stop_typing("room1")
         self.assertIn(("room1", False), self.adapter.mock_signaling.typing_events)
 
-    async def test_new_typing_tick_cancels_pending_status_release(self):
+    async def test_typing_ticks_do_not_create_room_processing_status(self):
         await self.adapter.send_typing("room1")
         await self.adapter.stop_typing("room1")
-        await asyncio.sleep(0.002)
-
         await self.adapter.send_typing("room1")
         await asyncio.sleep(0.02)
 
-        self.assertTrue(self.adapter.presence_mgr.is_busy)
-        self.assertIn("room1", self.adapter._active_turn_rooms)
-        await self.adapter.stop_typing("room1")
-        await asyncio.sleep(0.02)
         self.assertFalse(self.adapter.presence_mgr.is_busy)
+        self.assertNotIn("room1", self.adapter._active_turn_rooms)
 
     async def test_send_typing_starts_renew_task(self):
         await self.adapter.send_typing("room1")
@@ -591,6 +624,19 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         await self.adapter.mark_turn_finished()
         self.assertFalse(mgr.is_busy)
 
+    async def test_talk_cleanup_preserves_deck_owned_global_status(self):
+        account = self.adapter._presence_scope_key
+        register_presence_turn(account, "deck", "deck-presence-owner")
+        set_presence_turn_status(account, "deck", "deck-presence-owner", "Karte 42 · arbeitet", "🎴")
+        try:
+            await self.adapter.mark_turn_started("room-talk")
+            await self.adapter.mark_turn_finished("room-talk")
+            self.assertEqual(self.adapter.custom_status_clears, [])
+            self.assertEqual(self.adapter.custom_status_updates[-1], ("Karte 42 · arbeitet", "🎴"))
+            self.assertNotEqual(self.adapter.presence_updates[-1], "online")
+        finally:
+            unregister_presence_turn(account, "deck", "deck-presence-owner")
+
     async def test_last_turn_clears_global_custom_status(self):
         await self.adapter.mark_turn_started("room1")
         await self.adapter.mark_turn_started("room2")
@@ -605,13 +651,12 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.adapter.custom_status_clears, [True])
         self.assertEqual(self.adapter.presence_updates[-1], "online")
 
-    async def test_stop_typing_clears_custom_status_without_turn_hooks(self):
-        self.adapter._room_status_idle_grace_seconds = 0.01
+    async def test_turn_completion_clears_custom_status(self):
+        await self.adapter.mark_turn_started("room1")
         await self.adapter.send_or_update_status("room1", "_generating", "")
         self.assertTrue(self.adapter.presence_mgr.is_busy)
 
-        await self.adapter.stop_typing("room1")
-        await asyncio.sleep(0.02)
+        await self.adapter.mark_turn_finished("room1")
 
         self.assertFalse(self.adapter.presence_mgr.is_busy)
         self.assertEqual(self.adapter.custom_status_clears, [True])
@@ -626,8 +671,11 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         states = []
         original_handle = adapter.handle_message
 
+        processing_event = {"chat_id": "room-busy", "session_key": "session-busy"}
+
         async def spy_handle(event):
             await adapter.send_typing("room-busy")
+            await adapter.on_processing_start(processing_event)
             states.append(adapter.presence_mgr.is_busy)
             await original_handle(event)
 
@@ -639,7 +687,8 @@ class BusyPresenceContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(adapter.presence_mgr.is_busy)
 
         await adapter.stop_typing("room-busy")
-        await asyncio.sleep(0.02)
+        self.assertTrue(adapter.presence_mgr.is_busy)
+        await adapter.on_processing_complete(processing_event, "SUCCESS")
         self.assertFalse(adapter.presence_mgr.is_busy)
 
 

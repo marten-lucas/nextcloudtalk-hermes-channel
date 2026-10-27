@@ -18,7 +18,35 @@ from .client import NextcloudOCSException, NextcloudTalkClient
 from .hitl import HITLManager
 from .identity import NextcloudIdentityManager
 from .outbound import categorize_gateway_message
-from .platform_wip import finish_platform_turn, start_platform_turn
+
+try:
+    from .platform_wip import (
+        acquire_platform_turn,
+        active_platform_connections,
+        active_presence_status,
+        active_presence_turns,
+        finish_platform_turn,
+        presence_scope,
+        register_platform_connection,
+        register_presence_turn,
+        set_presence_turn_status,
+        unregister_platform_connection,
+        unregister_presence_turn,
+    )
+except ImportError:
+    from platform_wip import (  # type: ignore
+        acquire_platform_turn,
+        active_platform_connections,
+        active_presence_status,
+        active_presence_turns,
+        finish_platform_turn,
+        presence_scope,
+        register_platform_connection,
+        register_presence_turn,
+        set_presence_turn_status,
+        unregister_platform_connection,
+        unregister_presence_turn,
+    )
 from .presence import NextcloudPresenceManager
 from .signaling import NextcloudSignalingManager
 
@@ -268,6 +296,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         self._room_status_idle_grace_seconds = 3.0
         self._room_status_idle_tasks: Dict[str, asyncio.Task[None]] = {}
         self._user_status_lock = asyncio.Lock()
+        self._processing_turn_rooms: Dict[str, str] = {}
+        self._processing_event_fallback: Dict[int, tuple[Any, str]] = {}
+        self._legacy_turn_rooms: Dict[str, List[str]] = {}
+        self._connection_token = str(id(self))
+        self._presence_scope_key = presence_scope(base_url, username)
 
         # ── Empfangs-Überwachung (Resilience) ──
         # Anwendungsaktivität und Transport-/Poll-Aktivität getrennt halten.
@@ -344,14 +377,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         # Watchdog: startet beendete/geschlossene WS-Tasks neu.
         self._start_watchdog()
+        register_platform_connection("talk", self._connection_token, self._presence_scope_key)
 
-        await self.presence_mgr.set_presence_status(
-            "online"
-        )
-
-        await self.presence_mgr.clear_custom_status_message(
-            force=True
-        )
+        if active_presence_turns(self._presence_scope_key) > 0:
+            await self.presence_mgr.set_presence_status("busy", force=True)
+        else:
+            await self.presence_mgr.set_presence_status("online", force=True)
+            await self.presence_mgr.clear_custom_status_message(force=True)
 
         logger.info(
             "Nextcloud Talk: Adapter erfolgreich verbunden."
@@ -361,6 +393,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         self._stop_event.set()
+        unregister_platform_connection(
+            "talk",
+            getattr(self, "_connection_token", str(id(self))),
+            getattr(self, "_presence_scope_key", ""),
+        )
 
         tasks = [
             task
@@ -388,9 +425,16 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if self._speed_session and not self._speed_session.closed:
             await self._speed_session.close()
         self._speed_session = None
-        for room_key, active_count in tuple(self._active_turn_rooms.items()):
-            for _ in range(active_count):
-                finish_platform_turn("talk", room_key)
+        for token in tuple(self._processing_turn_rooms):
+            finish_platform_turn("talk", token)
+            unregister_presence_turn(self._presence_scope_key, "talk", token)
+        self._processing_turn_rooms.clear()
+        self._processing_event_fallback.clear()
+        for room_tokens in tuple(self._legacy_turn_rooms.values()):
+            for token in room_tokens:
+                finish_platform_turn("talk", token)
+                unregister_presence_turn(self._presence_scope_key, "talk", token)
+        self._legacy_turn_rooms.clear()
         self._active_turn_rooms.clear()
         for room_key in self._room_progress_status:
             self.presence_mgr.set_status_text(room_key, None)
@@ -399,8 +443,20 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         while self.presence_mgr.is_busy:
             await self.presence_mgr.clear_busy()
 
-        await self.presence_mgr.set_presence_status("offline")
-        await self.presence_mgr.clear_custom_status_message(force=True)
+        if (
+            active_platform_connections(account=self._presence_scope_key) == 0
+            and active_presence_turns(self._presence_scope_key) == 0
+        ):
+            await self.presence_mgr.set_presence_status("offline", force=True)
+            await self.presence_mgr.clear_custom_status_message(force=True)
+        elif active_presence_turns(self._presence_scope_key) > 0:
+            await self.presence_mgr.set_presence_status("busy", force=True)
+            status = active_presence_status(self._presence_scope_key)
+            if status is not None:
+                await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+        else:
+            await self.presence_mgr.clear_custom_status_message(force=True)
+            await self.presence_mgr.set_presence_status("online", force=True)
         await self.client.close()
 
         self._mark_disconnected()
@@ -1436,8 +1492,11 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 await self.presence_mgr.set_custom_status_message("Gateway restarting", "🔄")
                 await self.presence_mgr.set_presence_status("offline")
             elif state == "online":
-                await self.presence_mgr.set_presence_status("online")
-                await self.presence_mgr.clear_custom_status_message()
+                if active_presence_turns(self._presence_scope_key) > 0:
+                    await self.presence_mgr.set_presence_status("busy", force=True)
+                else:
+                    await self.presence_mgr.set_presence_status("online", force=True)
+                    await self.presence_mgr.clear_custom_status_message(force=True)
             elif state == "draining":
                 msg = details.get("text", "Gateway draining")
                 await self.presence_mgr.set_custom_status_message(msg[:140], "⏸️")
@@ -1550,33 +1609,119 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if room_key in self._active_turn_rooms:
                 self._speed_status_room = room_key
             display_message = f"{room_label} · {message}" if room_label else message
+            token = self._presence_token_for_room(room_key)
+            if token:
+                set_presence_turn_status(self._presence_scope_key, "talk", token, display_message, icon)
             self.presence_mgr.set_status_text(chat_id, display_message)
-            await self.presence_mgr.set_custom_status_message(display_message, icon)
+            await self.presence_mgr.set_custom_status_message(display_message, icon, force=True)
         return SendResult(success=True)
 
     # ── Typing-Indikator (Gateway-Contract) ─────────────────────────────
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Track Gateway's real background-turn heartbeat and signal Talk typing."""
-        room_key = str(chat_id or "").strip()
-        if room_key:
-            await self._activate_room_status(room_key)
+        """Send only the Talk typing signal; processing hooks own turn state."""
         try:
             await self.presence_mgr.send_typing(chat_id)
         except Exception:
             logger.debug("send_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
 
     async def stop_typing(self, chat_id: str) -> None:
-        """End the room's status after Gateway stopped refreshing that turn."""
-        room_key = str(chat_id or "").strip()
+        """Stop Talk's typing signal without changing processing lifecycle state."""
         try:
             await self.presence_mgr.stop_typing(chat_id)
         except Exception:
             logger.debug("stop_typing fehlgeschlagen für Raum %s", chat_id, exc_info=True)
-        if room_key in self._active_turn_rooms:
-            self._schedule_room_status_release(room_key)
-        elif not self.presence_mgr.is_busy:
-            await self._clear_idle_user_status()
+
+    @staticmethod
+    def _processing_event_value(event: Any, name: str) -> Any:
+        if isinstance(event, dict):
+            return event.get(name)
+        return getattr(event, name, None)
+
+    def _presence_token_for_room(self, room_key: str) -> Optional[str]:
+        for token, active_room in reversed(tuple(self._processing_turn_rooms.items())):
+            if active_room == room_key:
+                return token
+        legacy_tokens = self._legacy_turn_rooms.get(room_key) or []
+        return legacy_tokens[-1] if legacy_tokens else None
+
+    def _processing_room_key(self, event: Any) -> str:
+        for container in (event, self._processing_event_value(event, "source")):
+            if container is None:
+                continue
+            for name in ("chat_id", "room_id", "session_key", "session_id", "channel_id"):
+                if isinstance(container, dict):
+                    value = container.get(name)
+                else:
+                    value = getattr(container, name, None)
+                if value is not None and str(value).strip():
+                    return str(value).strip()
+        return "unknown"
+
+    def _get_processing_event_token(self, event: Any) -> Optional[str]:
+        try:
+            token = getattr(event, "_nextcloud_talk_processing_token", None)
+        except Exception:
+            token = None
+        if isinstance(token, str):
+            return token
+        entry = self._processing_event_fallback.get(id(event))
+        if entry is not None and entry[0] is event:
+            return entry[1]
+        return None
+
+    def _store_processing_event_token(self, event: Any, token: str) -> None:
+        try:
+            setattr(event, "_nextcloud_talk_processing_token", token)
+        except Exception:
+            self._processing_event_fallback[id(event)] = (event, token)
+
+    def _remove_processing_event_token(self, event: Any) -> None:
+        try:
+            delattr(event, "_nextcloud_talk_processing_token")
+        except Exception:
+            pass
+        entry = self._processing_event_fallback.get(id(event))
+        if entry is not None and entry[0] is event:
+            self._processing_event_fallback.pop(id(event), None)
+
+    async def on_processing_start(self, event: Any) -> None:
+        """Acquire shared WIP capacity for one actual Gateway processing turn."""
+        if self._get_processing_event_token(event) is not None:
+            return
+        room_key = self._processing_room_key(event)
+        token = f"{room_key}:{id(event)}"
+        self._store_processing_event_token(event, token)
+        try:
+            await acquire_platform_turn("talk", token)
+        except BaseException:
+            self._remove_processing_event_token(event)
+            raise
+
+        self._processing_turn_rooms[token] = room_key
+        register_presence_turn(self._presence_scope_key, "talk", token)
+        set_presence_turn_status(self._presence_scope_key, "talk", token, "Antwortet", "✍️")
+        try:
+            await self.mark_turn_started(room_key, _register_wip=False)
+        except BaseException:
+            self._processing_turn_rooms.pop(token, None)
+            self._remove_processing_event_token(event)
+            finish_platform_turn("talk", token)
+            unregister_presence_turn(self._presence_scope_key, "talk", token)
+            raise
+
+    async def on_processing_complete(self, event: Any, outcome: Any) -> None:
+        """Release exactly the WIP reservation acquired for this event."""
+        token = self._get_processing_event_token(event)
+        if token is None:
+            return
+        self._remove_processing_event_token(event)
+        room_key = self._processing_turn_rooms.pop(token, None)
+        if room_key is None:
+            return
+        finish_platform_turn("talk", token)
+        unregister_presence_turn(self._presence_scope_key, "talk", token)
+        await self.mark_turn_finished(room_key, _release_wip=False)
 
     async def _activate_room_status(self, room_key: str) -> None:
         idle_task = self._room_status_idle_tasks.pop(room_key, None)
@@ -1586,14 +1731,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
 
         if room_key not in self._active_turn_rooms:
             self._active_turn_rooms[room_key] = 1
-            start_platform_turn("talk", room_key)
             await self.presence_mgr.set_busy()
         self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
         self._speed_status_room = room_key
         async with self._user_status_lock:
             if self.presence_mgr.is_busy:
                 try:
-                    await self.presence_mgr.set_presence_status("busy")
+                    await self.presence_mgr.set_presence_status("busy", force=True)
                 except Exception:
                     logger.debug("Busy-Presence setzen fehlgeschlagen", exc_info=True)
         self._ensure_speed_heartbeat()
@@ -1614,8 +1758,6 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             return
         self._room_status_idle_tasks.pop(room_key, None)
         active_count = self._active_turn_rooms.pop(room_key, 0)
-        for _ in range(active_count):
-            finish_platform_turn("talk", room_key)
         self._room_progress_status.pop(room_key, None)
         self.presence_mgr.set_status_text(room_key, None)
         if self._speed_status_room == room_key:
@@ -1625,27 +1767,42 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         if not self.presence_mgr.is_busy:
             await self._clear_idle_user_status()
 
-    async def mark_turn_started(self, chat_id: Optional[str] = None) -> None:
+    async def mark_turn_started(
+        self,
+        chat_id: Optional[str] = None,
+        *,
+        _register_wip: bool = True,
+    ) -> None:
         """Mark an active turn and start the shared live-status heartbeat."""
+        room_key = str(chat_id or "").strip()
+        if room_key and _register_wip:
+            token = f"legacy:{room_key}:{time.monotonic_ns()}"
+            await acquire_platform_turn("talk", token)
+            self._legacy_turn_rooms.setdefault(room_key, []).append(token)
+            register_presence_turn(self._presence_scope_key, "talk", token)
+            set_presence_turn_status(self._presence_scope_key, "talk", token, "Antwortet", "✍️")
         try:
             await self.presence_mgr.set_busy()
         except Exception:
             logger.debug("Busy-Presence-Referenz setzen fehlgeschlagen", exc_info=True)
-        room_key = str(chat_id or "").strip()
         if room_key:
             self._active_turn_rooms[room_key] = self._active_turn_rooms.get(room_key, 0) + 1
-            start_platform_turn("talk", room_key)
             self._room_progress_status.setdefault(room_key, ("", "Antwortet", "✍️"))
             self._speed_status_room = room_key
         async with self._user_status_lock:
             if self.presence_mgr.is_busy:
                 try:
-                    await self.presence_mgr.set_presence_status("busy")
+                    await self.presence_mgr.set_presence_status("busy", force=True)
                 except Exception:
                     logger.debug("Busy-Presence setzen fehlgeschlagen", exc_info=True)
         self._ensure_speed_heartbeat()
 
-    async def mark_turn_finished(self, chat_id: Optional[str] = None) -> None:
+    async def mark_turn_finished(
+        self,
+        chat_id: Optional[str] = None,
+        *,
+        _release_wip: bool = True,
+    ) -> None:
         """Release one turn; retain busy/status while any turn remains active."""
         room_key = str(chat_id or "").strip()
         if room_key:
@@ -1656,8 +1813,13 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
                 self.presence_mgr.set_status_text(room_key, None)
             else:
                 self._active_turn_rooms[room_key] = active_count - 1
-            if active_count > 0:
-                finish_platform_turn("talk", room_key)
+            room_tokens = self._legacy_turn_rooms.get(room_key, [])
+            if _release_wip and room_tokens:
+                token = room_tokens.pop()
+                finish_platform_turn("talk", token)
+                unregister_presence_turn(self._presence_scope_key, "talk", token)
+                if not room_tokens:
+                    self._legacy_turn_rooms.pop(room_key, None)
             if self._speed_status_room == room_key:
                 self._speed_status_room = next(
                     reversed(self._active_turn_rooms), None
@@ -1672,9 +1834,33 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         """Clear the global status only after the final concurrent turn ends."""
         async with self._user_status_lock:
             if self.presence_mgr.is_busy:
+                await self.presence_mgr.set_presence_status("busy", force=True)
+                status = active_presence_status(self._presence_scope_key)
+                if status is not None:
+                    await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+                return
+            if active_presence_turns(self._presence_scope_key) > 0:
+                await self.presence_mgr.set_presence_status("busy", force=True)
+                status = active_presence_status(self._presence_scope_key)
+                if status is not None:
+                    await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+                else:
+                    await self.presence_mgr.clear_custom_status_message(force=True)
                 return
             await self._stop_speed_heartbeat()
             if self.presence_mgr.is_busy:
+                await self.presence_mgr.set_presence_status("busy", force=True)
+                status = active_presence_status(self._presence_scope_key)
+                if status is not None:
+                    await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+                return
+            if active_presence_turns(self._presence_scope_key) > 0:
+                await self.presence_mgr.set_presence_status("busy", force=True)
+                status = active_presence_status(self._presence_scope_key)
+                if status is not None:
+                    await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+                else:
+                    await self.presence_mgr.clear_custom_status_message(force=True)
                 return
             idle_tasks = [
                 task for task in self._room_status_idle_tasks.values()
@@ -1685,20 +1871,30 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
             if idle_tasks:
                 await asyncio.gather(*idle_tasks, return_exceptions=True)
             self._room_status_idle_tasks.clear()
-            for room_key, active_count in tuple(self._active_turn_rooms.items()):
-                for _ in range(active_count):
-                    finish_platform_turn("talk", room_key)
+            for room_tokens in tuple(self._legacy_turn_rooms.values()):
+                for token in room_tokens:
+                    finish_platform_turn("talk", token)
+                    unregister_presence_turn(self._presence_scope_key, "talk", token)
+            self._legacy_turn_rooms.clear()
             self._active_turn_rooms.clear()
             for room_key in self._room_progress_status:
                 self.presence_mgr.set_status_text(room_key, None)
             self._room_progress_status.clear()
             self._speed_status_room = None
             try:
-                await self.presence_mgr.clear_custom_status_message(force=True)
-                if self.presence_mgr.is_busy:
-                    await self.presence_mgr.set_presence_status("busy")
+                if active_presence_turns(self._presence_scope_key) > 0:
+                    await self.presence_mgr.set_presence_status("busy", force=True)
+                    status = active_presence_status(self._presence_scope_key)
+                    if status is not None:
+                        await self.presence_mgr.set_custom_status_message(status[0], status[1], force=True)
+                    else:
+                        await self.presence_mgr.clear_custom_status_message(force=True)
                     return
-                await self.presence_mgr.set_presence_status("online")
+                await self.presence_mgr.clear_custom_status_message(force=True)
+                if self.presence_mgr.is_busy or active_presence_turns(self._presence_scope_key) > 0:
+                    await self.presence_mgr.set_presence_status("busy", force=True)
+                    return
+                await self.presence_mgr.set_presence_status("online", force=True)
             except Exception:
                 logger.debug("Talk-User-Status beim Turn-Ende nicht bereinigt", exc_info=True)
 
@@ -1806,7 +2002,10 @@ class NextcloudTalkPlatform(BasePlatformAdapter):
         prefix = f"{room_label} · {action}" if room_label else action
         suffix = self._speed_suffix(speed)
         message = f"{prefix} ⚡ {suffix}" if suffix else prefix
-        await self.presence_mgr.set_custom_status_message(message, icon)
+        token = self._presence_token_for_room(room_key)
+        if token:
+            set_presence_turn_status(self._presence_scope_key, "talk", token, message, icon)
+        await self.presence_mgr.set_custom_status_message(message, icon, force=True)
 
     @staticmethod
     def _speed_suffix(speed: Dict[str, Any]) -> str:
